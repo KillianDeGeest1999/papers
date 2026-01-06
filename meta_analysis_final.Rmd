@@ -1,0 +1,1256 @@
+---
+title: "meta_analysis_final"
+author: "Killian"
+date: "2025-12-19"
+output: html_document
+---
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. preparation rmd
+## 1.1 setting seed for reproducibility
+
+```{r}
+set.seed(42)
+```
+
+## 1.2 loading packages
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(edgeR)
+library(tidyr)
+library(stringr)
+library(biomaRt)
+library(ggplot2)
+library(metapro)
+library(ggVennDiagram)
+library(UpSetR)
+library(DT)
+library(clusterProfiler)
+library(pathview)
+library(gage)
+library(gageData)
+library(grid)
+library(purrr)
+library(GO.db)
+```
+
+# 2. preparation of the data
+## 2.1 loading in count data and metadata
+
+```{r}
+# reading in read counts
+counts <- read.csv("counts.csv",row.names=1)
+metadata <- read.csv("metadata.csv", row.names = 1)
+
+# Order counts according to metadata
+counts <- counts[, metadata$Run]
+
+# Split counts based on the study
+campbell_counts <- counts[, metadata$Run[metadata$study == "campbell"], drop = FALSE]
+huang_counts <- counts[, metadata$Run[metadata$study == "huang"], drop = FALSE]
+smith_counts <- counts[, metadata$Run[metadata$study == "smith"], drop = FALSE]
+morris_counts <- counts[, metadata$Run[metadata$study == "morris"], drop = FALSE]
+```
+
+## 2.2 loading in annotation
+
+```{r}
+# loading in the annotation data downloaded from biomart "applatyrhynchos_gene_ensembl"
+annotation_data <- read.csv("Anas_platyrhynchos2_annotation.csv")
+
+# removing irrelevant columns
+annotation_data <- annotation_data[ -c(2,3,5,6,7)]
+
+# keep only unique/distinct rows 
+annotation_data <- distinct(annotation_data)
+
+# filter annotation_data2 to keep only genes present in your counts matrix.
+annotation_data <- annotation_data[annotation_data$ensembl_gene_id %in% rownames(counts), ]
+
+# order the annotation data so that it matches the row order of the counts matrix.
+annotation_data <- annotation_data[match(rownames(counts), annotation_data$ensembl_gene_id), ]
+
+# Check that the rownames of your counts and the annotation gene_id column match
+stopifnot(all(rownames(counts) == annotation_data$gene_id))
+```
+
+## 2.3 creating DGElist
+
+```{r}
+# Ensure metadata contains only samples present in counts
+metadata <- metadata %>% filter(Run %in% colnames(counts))
+
+# Reorder metadata to match counts column order
+metadata <- metadata[match(colnames(counts), metadata$Run), ]
+
+metadata <- metadata %>%
+  mutate(sample_id = paste(dpi, treatment, biological_replicate, sep = "_"))
+
+# Create DGEList object
+y <- DGEList(counts = counts, samples = metadata)
+
+campbell <- DGEList(counts = campbell_counts, samples = metadata %>% filter(study == "campbell"), genes = annotation_data)
+huang <- DGEList(counts = huang_counts, samples = metadata %>% filter(study == "huang"), genes = annotation_data)
+morris <- DGEList(counts = morris_counts, samples = metadata %>% filter(study == "morris"), genes = annotation_data)
+smith <- DGEList(counts = smith_counts, samples = metadata %>% filter(study=="smith"), genes = annotation_data)
+
+rm(campbell_counts,huang_counts,morris_counts,smith_counts)
+```
+
+# 3. visualisation, filtering, normalisation
+## 3.1 raw data exploration: principal component analysis
+
+```{r, message=FALSE, warning=FALSE}
+
+# Normalize counts using log-CPM and run PCA (samples as rows)
+pca <- prcomp(t(cpm(y, log = TRUE)), scale. = TRUE)
+
+# Convert PCA output to dataframe and merge with sample metadata
+pca <- merge(
+  transform(as.data.frame(pca$x), Run = rownames(pca$x)),
+  y$samples,
+  by = "Run"
+)
+
+# PCA colored by study, shaped by treatment
+ggplot(pca, aes(PC1, PC2, color = study, shape = treatment)) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  labs(title = "PCA with Ellipses") +
+  theme_minimal()
+
+# PCA colored by dpi, faceted by treatment
+ggplot(
+  pca,
+  aes(PC1, PC2, color = factor(dpi), shape = treatment, group = dpi)
+) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  facet_wrap(~ treatment) +
+  scale_color_viridis_d() +
+  labs(title = "PCA by Treatment", x = "PC1", y = "PC2", color = "dpi") +
+  theme_minimal()
+
+# Loop through each study and plot PCA separately
+for (s in unique(pca$study)) {
+  
+  gg <- ggplot(
+    na.omit(subset(pca, study == s)),
+    aes(PC1, PC2, color = factor(dpi), shape = treatment)
+  ) +
+    geom_point(size = 3) +
+    labs(title = paste("PCA Plot - Study:", s), x = "PC1", y = "PC2") +
+    scale_color_viridis_d() +
+    theme_minimal()
+  
+  # Add ellipse only when sufficient points are available
+  if (sum(pca$study == s) >= 3) gg <- gg + stat_ellipse()
+  
+  print(gg)
+}
+
+rm(pca, gg, y, counts)
+```
+## 3.2 sum techreplicates morris
+
+```{r}
+cat( 'The original dimensions of morris are', dim(morris), '/n')
+morris <- sumTechReps(morris, ID=morris$samples$sample_id)
+cat( 'After summing technical replicates they are', dim(morris))
+```
+
+# 3.3 filtering low count genes 
+
+```{r}
+# ---- FUNCTION TO FILTER DGEList AND REPORT DIMENSIONS ----
+filter_and_report <- function(dge) {
+  cat("before filtering\n")
+  print(dim(dge))
+  keep <- filterByExpr(dge, group = dge$samples$group)
+  dge  <- dge[keep, , keep.lib.sizes = FALSE]
+  cat("after filtering\n")
+  print(dim(dge))
+  dge
+}
+
+cat("campbell\n")
+campbell <- filter_and_report(campbell)
+
+cat("huang\n")
+huang <- filter_and_report(huang)
+
+cat("morris\n")
+morris <- filter_and_report(morris)
+
+cat("smith\n")
+smith <- filter_and_report(smith)
+
+rm(filter_and_report)
+
+```
+
+## 3.4 normalising
+
+```{r}
+campbell <- normLibSizes(campbell)
+huang <- normLibSizes(huang)
+morris <- normLibSizes(morris)
+smith <- normLibSizes(smith)
+```
+
+## 3.5 Principal component analysis after normalisation
+
+```{r, message = FALSE, warning=FALSE}
+plotPCA <- function(dge, title) {
+  # Convert counts to log-CPM and remove genes with zero variance
+  log_cpm <- cpm(dge, log=TRUE)
+  log_cpm <- log_cpm[apply(log_cpm, 1, var) > 0, ]
+  
+  # Perform PCA on the transposed log-CPM matrix
+  pca <- prcomp(t(log_cpm), scale. = TRUE)
+  
+  # Create a data frame with PCA results and sample metadata
+  pca <- data.frame(pca$x[,1:2], dge$samples)
+  
+  # Create the PCA plot with ggplot2, including ellipses
+  ggplot(pca, aes(x = PC1, y = PC2, color = factor(dpi), shape = factor(treatment))) +
+    geom_point(size = 3) +
+    #stat_ellipse(aes(group = factor(dpi)), level = 0.95, linetype = "dashed") +  # 95% confidence ellipses
+    stat_ellipse(aes(group = interaction(dpi, treatment)), level = 0.95, linetype = "dashed") +
+    ggtitle(title) +
+    labs(color = "dpi", shape = "treatment") +
+    theme_minimal()
+}
+# Create the PCA plots for each dataset with ellipses
+p1 <- plotPCA(campbell, "Campbell: PCA Plot")
+p2 <- plotPCA(huang, "Huang: PCA Plot")
+p3 <- plotPCA(morris, "Morris: PCA Plot")
+p4 <- plotPCA(smith, "Smith: PCA Plot")
+
+# Print plots (if using RStudio, they'll appear in the Plots pane)
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+
+rm(p1,p2,p3,p4)
+```
+# 4. differential expression analysis
+## 4.1 estimate dispersion and fit model
+
+```{r}
+design_campbell <-  model.matrix(~ 0 + group, data = campbell$samples)
+colnames(design_campbell) <- gsub("group", "", colnames(design_campbell))
+campbell <- estimateDisp(campbell, design_campbell)
+fit_campbell <- glmFit(campbell,design_campbell)
+
+design_smith <-  model.matrix(~ 0 + group, data = smith$samples)
+colnames(design_smith) <- gsub("group", "", colnames(design_smith))
+smith <- estimateDisp(smith, design_smith)
+fit_smith <- glmFit(smith,design_smith)
+
+design_morris <-  model.matrix(~ 0 + group, data = morris$samples)
+colnames(design_morris) <- gsub("group", "", colnames(design_morris))
+morris <- estimateDisp(morris, design_morris)
+fit_morris <- glmFit(morris,design_morris)
+
+design_huang <-  model.matrix(~ 0 + group, data = huang$samples)
+colnames(design_huang) <- gsub("group", "", colnames(design_huang))
+bcv <- mean(morris$common.dispersion,campbell$common.dispersion,smith$common.dispersion)
+fit_huang <- glmFit(huang, design_huang, dispersion = bcv^2)
+```
+
+## 4.2 differential expression
+
+```{r}
+contrasts_campbell <- makeContrasts(
+  HPvsControl_1dpi = HP_1 - control_1,
+  HPvsControl_2dpi = HP_2 - control_2,
+  HPvsControl_3dpi = HP_3 - control_3,
+  levels = design_campbell
+)
+
+campbell_1 <- topTags(glmLRT(fit_campbell, contrast = contrasts_campbell[,"HPvsControl_1dpi"]),n = Inf)$table
+campbell_2 <- topTags(glmLRT(fit_campbell, contrast = contrasts_campbell[,"HPvsControl_2dpi"]),n = Inf)$table
+campbell_3 <- topTags(glmLRT(fit_campbell, contrast = contrasts_campbell[,"HPvsControl_3dpi"]),n = Inf)$table
+
+contrasts_huang <- makeContrasts(
+  HPvsControl_1dpi = HP_1 - control_3,
+  HPvsControl_2dpi = HP_2 - control_3,
+  HPvsControl_3dpi = HP_3 - control_3,
+  levels = design_huang
+)
+
+huang_1 <- topTags(glmLRT(fit_huang, contrast = contrasts_huang[,"HPvsControl_1dpi"]),n = Inf)$table
+huang_2 <- topTags(glmLRT(fit_huang, contrast = contrasts_huang[,"HPvsControl_2dpi"]),n = Inf)$table
+huang_3 <- topTags(glmLRT(fit_huang, contrast = contrasts_huang[,"HPvsControl_3dpi"]),n = Inf)$table
+
+contrasts_smith <- makeContrasts(
+  HPvsControl_1dpi = HP_1 - control_1,
+  HPvsControl_3dpi = HP_3 - control_3,
+  levels = design_smith
+)
+contrasts_smith <- makeContrasts(
+  HPvsControl_1dpi = HP_1 - control_1,
+  HPvsControl_3dpi = HP_3 - control_3,
+  levels = design_smith
+)
+
+smith_1 <- topTags(glmLRT(fit_smith, contrast = contrasts_smith[,"HPvsControl_1dpi"]),n = Inf)$table
+smith_3 <- topTags(glmLRT(fit_smith, contrast = contrasts_smith[,"HPvsControl_3dpi"]),n = Inf)$table
+
+contrasts_morris <- makeContrasts(
+  HPvsControl_2.2_2dpi = HP_2.2_2 - control_0,
+  HPvsControl_2.3.2.1_2dpi = HP_2.3.2.1_2 - control_0,
+  levels = design_morris
+)
+
+morris_2.2_2 <- topTags(glmLRT(fit_morris, contrast = contrasts_morris[,"HPvsControl_2.2_2dpi"]),n = Inf)$table
+morris_2.3.2.1_2 <- topTags(glmLRT(fit_morris, contrast = contrasts_morris[,"HPvsControl_2.3.2.1_2dpi"]),n = Inf)$table
+
+rm(campbell, contrasts_campbell,fit_campbell, design_campbell,
+   huang, contrasts_huang,fit_huang, design_huang,
+   morris, contrasts_morris, fit_morris, design_morris,
+   smith, contrasts_smith, fit_smith, design_smith)
+```
+## 4.3 Venn diagrams — FDR only, per dpi
+
+```{r}
+
+# Extract gene names based on FDR and optional logFC direction
+get_genes <- function(tab, lfc = NULL, alpha = 0.05) {
+  keep <- tab$FDR <= alpha
+  if (!is.null(lfc))
+    keep <- keep & (if (lfc > 0) tab$logFC > 0 else tab$logFC < 0)
+  rownames(tab[keep, ])
+}
+
+# Plot a Venn diagram with consistent styling
+plot_venn <- function(sets, title, color) {
+  ggVennDiagram(sets) +
+    scale_fill_gradient(low = "white", high = color) +
+    ggtitle(title)
+}
+
+# ---- 1 dpi ----
+
+plot_venn(
+  list(
+    `Campbell 1dpi` = get_genes(campbell_1),
+    `Huang 1dpi`    = get_genes(huang_1),
+    `Smith 1dpi`    = get_genes(smith_1)
+  ),
+  "1 dpi — FDR ≤ 0.05",
+  "red"
+)
+
+plot_venn(
+  list(
+    `Campbell 1dpi` = get_genes(campbell_1,  1),
+    `Huang 1dpi`    = get_genes(huang_1,     1),
+    `Smith 1dpi`    = get_genes(smith_1,     1)
+  ),
+  "1 dpi — Upregulated (FDR ≤ 0.05)",
+  "red"
+)
+
+plot_venn(
+  list(
+    `Campbell 1dpi` = get_genes(campbell_1, -1),
+    `Huang 1dpi`    = get_genes(huang_1,    -1),
+    `Smith 1dpi`    = get_genes(smith_1,    -1)
+  ),
+  "1 dpi — Downregulated (FDR ≤ 0.05)",
+  "red"
+)
+
+# ---- 2 dpi ----
+
+plot_venn(
+  list(
+    `Morris 2.2 2dpi`      = get_genes(morris_2.2_2),
+    `Morris 2.3.2.1 2dpi`  = get_genes(morris_2.3.2.1_2),
+    `Campbell 2dpi`        = get_genes(campbell_2),
+    `Huang 2dpi`           = get_genes(huang_2)
+  ),
+  "2 dpi — FDR ≤ 0.05",
+  "blue"
+)
+
+plot_venn(
+  list(
+    `Morris 2.2 2dpi`      = get_genes(morris_2.2_2,  1),
+    `Morris 2.3.2.1 2dpi`  = get_genes(morris_2.3.2.1_2, 1),
+    `Campbell 2dpi`        = get_genes(campbell_2,  1),
+    `Huang 2dpi`           = get_genes(huang_2,     1)
+  ),
+  "2 dpi — Upregulated (FDR ≤ 0.05)",
+  "blue"
+)
+
+plot_venn(
+  list(
+    `Morris 2.2 2dpi`      = get_genes(morris_2.2_2, -1),
+    `Morris 2.3.2.1 2dpi`  = get_genes(morris_2.3.2.1_2, -1),
+    `Campbell 2dpi`        = get_genes(campbell_2, -1),
+    `Huang 2dpi`           = get_genes(huang_2,    -1)
+  ),
+  "2 dpi — Downregulated (FDR ≤ 0.05)",
+  "blue"
+)
+
+# ---- 3 dpi ----
+
+plot_venn(
+  list(
+    `Campbell 3dpi` = get_genes(campbell_3),
+    `Huang 3dpi`    = get_genes(huang_3),
+    `Smith 3dpi`    = get_genes(smith_3)
+  ),
+  "3 dpi — FDR ≤ 0.05",
+  "purple"
+)
+
+plot_venn(
+  list(
+    `Campbell 3dpi` = get_genes(campbell_3,  1),
+    `Huang 3dpi`    = get_genes(huang_3,     1),
+    `Smith 3dpi`    = get_genes(smith_3,     1)
+  ),
+  "3 dpi — Upregulated (FDR ≤ 0.05)",
+  "purple"
+)
+
+plot_venn(
+  list(
+    `Campbell 3dpi` = get_genes(campbell_3, -1),
+    `Huang 3dpi`    = get_genes(huang_3,    -1),
+    `Smith 3dpi`    = get_genes(smith_3,    -1)
+  ),
+  "3 dpi — Downregulated (FDR ≤ 0.05)",
+  "purple"
+)
+
+# ---- CLEANUP ----
+rm(get_genes, plot_venn)
+
+```
+# 5. PValue combination
+## 5.1 checking if the pvalue distribution under the null hypothesis is uniform
+
+```{r}
+for (x in list(
+  smith_1, smith_3,
+  campbell_1, campbell_2, campbell_3,
+  morris_2.3.2.1_2, morris_2.2_2,
+  huang_1, huang_2, huang_3
+)) {
+  hist(x$PValue, breaks = 20, col = "skyblue", border = "white")
+}
+rm (x,s)
+```
+
+## 5.2 pvalue combination: weighted fisher
+
+```{r}
+
+metaAnalysis <- function(study_list, study_names, weights, annotation_data) {
+  # ---- 1. Identify genes common to all studies ----
+  common_genes <- Reduce(intersect, lapply(study_list, rownames))
+  
+  # ---- 2. Initialize output with gene IDs ----
+  out <- data.frame(
+    gene = common_genes,
+    p_combined = NA_real_,
+    eff_direction = NA_real_,
+    same_direction = NA,
+    studies_included = NA_character_,
+    stringsAsFactors = FALSE
+  )
+  # Add columns for each study's logFC, PValue, FDR
+  for(study in study_names) {
+    out[[paste0("logFC_", study)]] <- NA_real_
+    out[[paste0("PValue_", study)]] <- NA_real_
+    out[[paste0("FDR_", study)]] <- NA_real_
+  }
+  # ---- 3. Loop over genes ----
+  for(i in seq_along(common_genes)) {
+    gene <- common_genes[i]
+    # Extract stats across studies efficiently
+    p_values <- sapply(study_list, function(df) df[gene, "PValue"])
+    fc_values <- sapply(study_list, function(df) df[gene, "logFC"])
+    fdr_values <- sapply(study_list, function(df) df[gene, "FDR"])
+    # Fill per-study columns
+    for(j in seq_along(study_names)) {
+      out[i, paste0("logFC_", study_names[j])] <- fc_values[j]
+      out[i, paste0("PValue_", study_names[j])] <- p_values[j]
+      out[i, paste0("FDR_", study_names[j])] <- fdr_values[j]
+    }
+    # ---- 3a. Weighted Fisher meta-analysis ----
+    wf <- wFisher(p = p_values, weight = weights, is.onetail = FALSE, eff.sign = sign(fc_values))
+    out$p_combined[i] <- wf$p
+    out$eff_direction[i] <- wf$overall.eff.direction
+    out$same_direction[i] <- all(fc_values > 0) || all(fc_values < 0)
+    out$studies_included[i] <- paste(study_names, collapse = ", ")
+  }
+  # ---- 4. Add gene names ----
+  gene_name_map <- setNames(annotation_data$external_gene_name, annotation_data$ensembl_gene_id)
+  out$gene_name <- gene_name_map[out$gene]
+  
+  # ---- 5. Combined FDR ----
+  out$FDR_combined <- p.adjust(out$p_combined, method = "BH")
+  
+  # ---- 6. Reorder columns ----
+  other_cols <- setdiff(names(out), c("gene", "gene_name", "p_combined", "FDR_combined", 
+                                      "same_direction", "studies_included"))
+  out <- out[, c("gene", "gene_name", "p_combined", "FDR_combined", "same_direction",
+                 "studies_included", other_cols)]
+  
+  # ---- 7. Order by FDR_combined ----
+  out <- out[order(out$FDR_combined), ]
+  
+  return(out)
+}
+
+combined_2 <- metaAnalysis(
+  study_list = list(morris_2.2_2, morris_2.3.2.1_2, campbell_2, huang_2),
+  study_names = c("morris_2.2_2", "morris_2.3.2.1_2", "campbell_2", "huang_2"),
+  weights = c(3, 3, 4, 1),
+  annotation_data = annotation_data
+)
+
+combined_1 <- metaAnalysis(
+  study_list = list(campbell_1, smith_1, huang_1),
+  study_names = c("campbell_1", "smith_1", "huang_1"),
+  weights = c(4, 3, 1),
+  annotation_data = annotation_data
+)
+
+combined_3 <- metaAnalysis(
+  study_list = list(campbell_3, smith_3, huang_3),
+  study_names = c("campbell_3", "smith_3", "huang_3"),
+  weights = c(4, 3, 1),
+  annotation_data = annotation_data
+)
+
+head(combined_3)
+
+```
+## 5.3 jackknife sampling
+
+```{r}
+# Jackknife helper: Remove one study at a time and run metaAnalysis on the remaining studies.
+jackknife_meta2 <- function(study_list, study_names, weights, annotation_data) {
+  jackknife_results <- list()
+  for(i in seq_along(study_list)) {
+    # Exclude the i-th study
+    res <- metaAnalysis(
+      study_list = study_list[-i],
+      study_names = study_names[-i],
+      weights = weights[-i],
+      annotation_data = annotation_data
+    )
+    leave_out <- study_names[i]
+    jackknife_results[[paste0("jackknife_excluding_", leave_out)]] <- res
+  }
+  return(jackknife_results)
+}
+
+studies_1 <- list(
+  "campbell_1" = campbell_1,
+  "smith_1"    = smith_1,
+  "huang_1"    = huang_1)
+jackknife_results_1 <- jackknife_meta2(study_list = studies_1, 
+                                       study_names = names(studies_1), 
+                                       weights = c(4, 3, 1),
+                                       annotation_data)
+
+studies_2 <- list("morris_2.2_2"     = morris_2.2_2,
+  "morris_2.3.2.1_2" = morris_2.3.2.1_2,
+  "campbell_2"       = campbell_2,
+  "huang_2"          = huang_2)
+jackknife_results_2 <- jackknife_meta2(study_list = studies_2, 
+                                       study_names = names(studies_2), 
+                                       weights = c(3, 3, 4, 1),
+                                       annotation_data)
+
+studies_3 <- list(
+  "campbell_3" = campbell_3,
+  "smith_3"    = smith_3,
+  "huang_3"    = huang_3)
+jackknife_results_3 <- jackknife_meta2(study_list = studies_3, 
+                                       study_names = names(studies_3), 
+                                       weights = c(4, 3, 1),
+                                       annotation_data)
+```
+## 5.5 preparation upsetplot of jackknife
+
+```{r}
+prepare_jackknife <- function(combined, jack_results, study_order, fdr_cols, direction_col = "eff_direction") {
+  library(dplyr)
+  
+  # Merge all jackknife datasets
+  for (study in study_order) {
+    combined <- combined %>%
+      left_join(
+        jack_results[[paste0("jackknife_excluding_", study)]] %>%
+          dplyr::select(
+            gene,
+            !!paste0("p_combined_no_", study) := p_combined,
+            !!paste0("FDR_combined_no_", study) := FDR_combined,
+            !!paste0("same_direction_no_", study) := same_direction,
+            !!paste0("eff_direction_no_", study) := eff_direction
+          ),
+        by = "gene"
+      )
+  }
+  
+  direction_cols <- paste0(direction_col, "_no_", study_order)
+  fdr_no_cols     <- paste0("FDR_combined_no_", study_order)
+  
+  combined <- combined %>%
+    rowwise() %>%
+    mutate(
+      jackknife = as.integer(
+        length(unique(c_across(all_of(direction_cols))[!is.na(c_across(all_of(direction_cols)))])) == 1 &
+        all(c_across(all_of(fdr_no_cols)) < 0.05)
+      ),
+      combined = as.integer(FDR_combined < 0.05)
+    ) %>%
+    ungroup() %>%
+    mutate(across(all_of(fdr_cols), ~ as.integer(. < 0.05), .names = "{.col}"))
+  
+  return(combined)
+}
+
+# ---- 1 dpi ----
+combined_1_jackknife <- prepare_jackknife(
+  combined = combined_1,
+  jack_results = jackknife_results_1,
+  study_order = c("campbell_1", "smith_1", "huang_1"),
+  fdr_cols = c(campbell = "FDR_campbell_1",
+               smith = "FDR_smith_1",
+               huang  = "FDR_huang_1")
+)
+
+# ---- 2 dpi ----
+combined_2_jackknife <- prepare_jackknife(
+  combined = combined_2,
+  jack_results = jackknife_results_2,
+  study_order = c("campbell_2", "huang_2", "morris_2.3.2.1_2", "morris_2.2_2"),
+  fdr_cols = c(campbell = "FDR_campbell_2",
+               huang  = "FDR_huang_2",
+               morris_2.3.2.1 = "FDR_morris_2.3.2.1_2",
+               morris_2.2     = "FDR_morris_2.2_2")
+)
+
+# ---- 3 dpi ----
+combined_3_jackknife <- prepare_jackknife(
+  combined = combined_3,
+  jack_results = jackknife_results_3,
+  study_order = c("campbell_3", "smith_3", "huang_3"),
+  fdr_cols = c(campbell = "FDR_campbell_3",
+               smith     = "FDR_smith_3",
+               huang     = "FDR_huang_3")
+)
+
+```
+
+```{r}
+combined_1_jackknife <- as.data.frame(combined_1_jackknife)
+combined_2_jackknife <- as.data.frame(combined_2_jackknife)
+combined_3_jackknife <- as.data.frame(combined_3_jackknife)
+
+upset(combined_1_jackknife,sets = c("smith","campbell","huang","combined","jackknife"))
+upset(combined_2_jackknife, sets = c("huang","campbell","morris_2.2","morris_2.3.2.1","combined","jackknife"))
+upset(combined_3_jackknife,sets = c("smith","campbell","huang","combined","jackknife"))
+```
+
+```{r, fig.height=1, fig.width = 7}
+ggplot() + 
+  labs(
+    title = "Significant differentially expressed genes (DEGs, FDR < 0.05) across three studies \nand meta-analysis of HPAI H5N1 infection in ducks (3 dpi)",
+    subtitle = "Lower half of upset plot highlights the intersections between studies: • present ◦ not present"
+  ) +
+  theme(panel.background = element_blank())
+
+ggsave(filename = "title.png", dpi = 1000)
+
+```
+
+# 6. interactive datatables
+## 6.1 all data
+
+```{r, message=FALSE, warning=FALSE}
+datatable(combined_1_jackknife)
+datatable(combined_2_jackknife)
+datatable(combined_3_jackknife)
+```
+
+# 7. bar plots with logfoldchanges of interesting genes
+# 7.1 top 20 from combined
+
+```{r}
+combined_1_jackknife %>%
+  filter(!is.na(gene_name)& gene_name != "", combined == 1) %>%
+  slice_head(n = 20) %>%
+  dplyr::select(gene_name, logFC_campbell_1, logFC_smith_1, logFC_huang_1) %>%
+  pivot_longer(-gene_name, names_to = "source", values_to = "logFC") %>%
+  ggplot(aes(x = gene_name, y = logFC, fill = source)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Log Fold Changes for 1dpi", x = "Gene", y = "logFC") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+combined_2_jackknife %>%
+  filter(!is.na(gene_name)& gene_name != "", combined == 1) %>%
+  slice_head(n = 20) %>%
+  dplyr::select(gene_name, logFC_morris_2.2_2, logFC_morris_2.3.2.1_2, logFC_campbell_2, logFC_huang_2) %>%
+  pivot_longer(-gene_name, names_to = "source", values_to = "logFC") %>%
+  ggplot(aes(x = gene_name, y = logFC, fill = source)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Log Fold Changes for 2dpi", x = "Gene", y = "logFC") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+combined_3_jackknife %>%
+  filter(!is.na(gene_name)& gene_name != "", combined == 1) %>%
+  slice_head(n = 20) %>%
+  dplyr::select(gene_name, logFC_campbell_3, logFC_smith_3, logFC_huang_3) %>%
+  pivot_longer(-gene_name, names_to = "source", values_to = "logFC") %>%
+  ggplot(aes(x = gene_name, y = logFC, fill = source)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Log Fold Changes for 3dpi", x = "Gene", y = "logFC") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 8. Gene Ontology (overrepresentation analysis)
+## 8.1 preparing annotation and function
+
+```{r}
+annotation_data <- read.csv("Anas_platyrhynchos2_annotation.csv")
+
+# Prepare TERM2GENE: GO term to Ensembl gene ID
+TERM2GENE <- annotation_data %>%
+  dplyr::select(go_id, ensembl_gene_id) %>%
+  filter(!is.na(go_id), !is.na(ensembl_gene_id)) %>%
+  distinct()
+
+# Prepare TERM2NAME: GO ID to GO term name (if available)
+if ("name_1006" %in% colnames(annotation_data)) {
+  TERM2NAME <- annotation_data %>%
+    dplyr::select(go_id, name_1006) %>%
+    distinct()
+} else {
+  TERM2NAME <- NA
+}
+
+plotgo <- function(target_genes, title = "GO Enrichment") {
+  go_enrich <- enricher(
+    gene = target_genes,
+    TERM2GENE = TERM2GENE,
+    TERM2NAME = TERM2NAME,
+    pvalueCutoff = 0.05
+  )
+  
+  if (!is.null(go_enrich) && nrow(go_enrich@result) > 0) {
+    barplot(go_enrich, showCategory = 20, title = title)
+  } else {
+    message("No enrichment found.")
+  }
+}
+
+```
+
+## 8.2 pvalue combination
+
+### 8.2.1 differentially expressed genes found after pvalue combination
+
+```{r, fig.heigth= 15, fig.width = 15}
+goi <- combined_1_jackknife %>%
+  filter(combined == 1) %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "differentially expressed genes found after pvalue combination, 1 day post infection")
+
+goi <- combined_2_jackknife %>%
+  filter(combined == 1) %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "differentially expressed genes found after pvalue combination, 2 days post infection")
+
+goi <- combined_3_jackknife %>%
+  filter(combined == 1) %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "differentially expressed genes found after pvalue combination, 3 days post infection")
+```
+
+### 8.2.2 upregulated genes after pvalue combination
+
+```{r, fig.heigth= 15, fig.width = 15}
+goi <- combined_1_jackknife %>%
+  filter(combined == 1, eff_direction == '+') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "upregulated genes found after pvalue combination, 1 day post infection")
+
+goi <- combined_2_jackknife %>%
+  filter(combined == 1, eff_direction == '+') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "upregulated genes found after pvalue combination, 2 days post infection")
+
+goi <- combined_3_jackknife %>%
+  filter(combined == 1, eff_direction == '+') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "upregulated genes found after pvalue combination, 3 days post infection")
+```
+
+### 8.2.3 downregulated genes after pvalue combination
+
+```{r, fig.heigth= 15, fig.width = 15}
+goi <- combined_1_jackknife %>%
+  filter(combined == 1, eff_direction == '-') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "downregulated genes found after pvalue combination, 1 day post infection")
+
+goi <- combined_2_jackknife %>%
+  filter(combined == 1, eff_direction == '-') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "downregulated genes found after pvalue combination, 2 days post infection")
+
+goi <- combined_3_jackknife %>%
+  filter(combined == 1, eff_direction == '-') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "downregulated genes found after pvalue combination, 3 days post infection")
+```
+
+## 8.3 jackknife analysis
+
+### 8.3.1 upregulated genes found by jackknife analysis
+
+```{r, fig.heigth= 15, fig.width = 15}
+goi <- combined_1_jackknife %>%
+  filter(jackknife == 1, eff_direction == '+') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "upregulated genes found after jackknife, 1 day post infection")
+
+goi <- combined_2_jackknife %>%
+  filter(jackknife == 1, eff_direction == '+') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "upregulated genes found after jackknife, 2 days post infection")
+
+goi <- combined_3_jackknife %>%
+  filter(jackknife == 1, eff_direction == '+') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "upregulated genes found after jackknife, 3 days post infection")
+```
+
+### 8.3.2 downregulated genes found by jackknife analysis
+
+```{r, fig.heigth= 15, fig.width = 15}
+goi <- combined_1_jackknife %>%
+  filter(jackknife == 1, eff_direction == '-') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "downregulated genes found after jackknife, 1 day post infection")
+
+goi <- combined_2_jackknife %>%
+  filter(jackknife == 1, eff_direction == '-') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "downregulated genes found after jackknife, 2 days post infection")
+
+goi <- combined_3_jackknife %>%
+  filter(jackknife == 1, eff_direction == '-') %>%
+  pull(gene) %>%
+  unique() %>%
+  na.omit()
+
+plotgo(goi, title = "downregulated genes found after jackknife, 3 days post infection")
+```
+
+# 9. KEGG (overrepresentation analysis)
+## 9.1 KEGG Gallus gallus
+
+```{r}
+duck_to_gallus <- read.csv('duck_to_gallus.csv')
+annotation_gallus <- read.csv("annotation_gallus_.csv")
+
+process_jack <- function(df, orthology_df, annotation_df) {
+  df %>%
+    left_join(
+      orthology_df %>% dplyr::select(initial_ensg, ortholog_ensg, ortholog_name),
+      by = c("gene" = "initial_ensg")
+    ) %>%
+    left_join(
+      annotation_df %>% dplyr::select(ensembl_gene_id, entrezgene_id),
+      by = c("ortholog_ensg" = "ensembl_gene_id")
+    ) %>%
+    distinct() %>%
+    filter(!is.na(entrezgene_id)) %>%
+    arrange(gene, is.na(ortholog_name), str_starts(ortholog_name, "ENSGALG")) %>%
+    group_by(gene) %>%
+    dplyr::slice(1) %>%
+    ungroup()
+}
+
+# Usage for Gallus:
+combined_1_jackknife_gallus <- process_jack(combined_1_jackknife, duck_to_gallus, annotation_gallus)
+combined_2_jackknife_gallus <- process_jack(combined_2_jackknife, duck_to_gallus, annotation_gallus)
+combined_3_jackknife_gallus <- process_jack(combined_3_jackknife, duck_to_gallus, annotation_gallus)
+```
+
+```{r}
+plotkegg <- function(target_genes, title,organism){
+  kegg_enrich <- enrichKEGG(
+    gene = target_genes,
+    organism = organism,
+    pvalueCutoff = 0.05
+  )
+  if (!is.null(kegg_enrich) && nrow(kegg_enrich@result) > 0) {
+  barplot(kegg_enrich, showCategory = 20, title = title)
+} else {
+  message("No enrichment found.")
+}
+}
+```
+
+### 9.1.1 upregulated genes combined
+
+```{r, fig.width=15,fig.height=15}
+goi <- combined_1_jackknife_gallus %>%
+  filter(combined == 1, eff_direction == '+') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"upregulated genes after pvalue combination, 1 day post infection","gga")
+
+goi <- combined_2_jackknife_gallus %>%
+  filter(combined == 1, eff_direction == '+') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"upregulated genes after pvalue combination, 2 day post infection","gga")
+
+goi <- combined_3_jackknife_gallus %>%
+  filter(combined == 1, eff_direction == '+') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"upregulated genes after pvalue combination, 3 day post infection","gga")
+
+```
+
+### 9.1.2 downregulated genes combined
+
+```{r, fig.width=15,fig.height=15}
+goi <- combined_1_jackknife_gallus %>%
+  filter(combined == 1, eff_direction == '-') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"downregulated genes after pvalue combination, 1 day post infection","gga")
+
+goi <- combined_2_jackknife_gallus %>%
+  filter(combined == 1, eff_direction == '-') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"downregulated genes after pvalue combination, 2 day post infection","gga")
+
+goi <- combined_3_jackknife_gallus %>%
+  filter(combined == 1, eff_direction == '-') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"downregulated genes after pvalue combination, 3 day post infection","gga")
+
+```
+
+### 9.1.3 upregulated genes jackknife
+
+```{r, fig.width=15,fig.height=15}
+goi <- combined_1_jackknife_gallus %>%
+  filter(jackknife == 1, eff_direction == '+') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"upregulated genes after jackknife, 1 day post infection","gga")
+
+goi <- combined_2_jackknife_gallus %>%
+  filter(jackknife == 1, eff_direction == '+') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"upregulated genes after jackknife, 2 day post infection","gga")
+
+goi <- combined_3_jackknife_gallus %>%
+  filter(jackknife == 1, eff_direction == '+') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"Upregulated pathways after jackknife sensitivity analysis, 3 day post infection","gga") + 
+  scale_fill_gradient(low = rgb(188, 207, 0, maxColorValue = 255),
+                            high = rgb(58, 170, 53, maxColorValue = 255)) 
+
+```
+
+### 9.1.4 downregulated genes jackknife
+
+```{r, fig.width=15,fig.height=15}
+goi <- combined_1_jackknife_gallus %>%
+  filter(jackknife == 1, eff_direction == '-') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"downregulated genes after jackknife, 1 day post infection","gga")
+
+goi <- combined_2_jackknife_gallus %>%
+  filter(jackknife == 1, eff_direction == '-') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"downregulated genes after jackknife, 2 day post infection","gga")
+
+goi <- combined_3_jackknife_gallus %>%
+  filter(jackknife == 1, eff_direction == '-') %>%
+  pull(entrezgene_id) %>%
+  unique() %>%
+  na.omit()
+
+plotkegg(goi,"downregulated genes after jackknife, 3 day post infection","gga")
+```
+
+# 10. visualisation of certain pathways
+
+adding an extra column for the direction (up is 1, down is -1), this is just for visualisation
+
+```{r}
+combined_1_jackknife_gallus <- combined_1_jackknife_gallus %>%
+  mutate(direction_value = ifelse(eff_direction == "+", 1, -1))
+
+combined_2_jackknife_gallus <- combined_2_jackknife_gallus %>%
+  mutate(direction_value = ifelse(eff_direction == "+", 1, -1))
+
+combined_3_jackknife_gallus <- combined_3_jackknife_gallus %>%
+  mutate(direction_value = ifelse(eff_direction == "+", 1, -1))
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+# List your data frames with associated day labels:
+df_list <- list(
+  day1 = combined_1_jackknife_gallus,
+  day2 = combined_2_jackknife_gallus,
+  day3 = combined_3_jackknife_gallus
+)
+
+# Pathway IDs
+pathway_ids <- c(
+  'gga05164', # influenza a
+  'gga04620', # toll like receptor
+  'gga04621', # NOD like receptor signaling pathway
+  'gga04622', # RIGI like receptor
+  'gga04210', # apoptosis
+  'gga04217'  # necroptosis
+)
+
+# Ensure each table has column direction_value already; 
+# if not, create it from eff_direction:
+for(name in names(df_list)) {
+  df <- df_list[[name]]
+  if (!"direction_value" %in% colnames(df) && "eff_direction" %in% colnames(df)) {
+    df$direction_value <- ifelse(df$eff_direction == "+", 1, -1)
+    df_list[[name]] <- df
+  }
+}
+
+# Loop over days and subsets
+for(day_label in names(df_list)) {
+  df <- df_list[[day_label]]
+  
+  # For each subset type: jackknife==1 and combined==1
+  for(subset_type in c("jackknife", "combined")) {
+    # Check column exists
+    if (!subset_type %in% colnames(df)) {
+      message(sprintf("Skipping %s for %s: column '%s' not found.", day_label, subset_type, subset_type))
+      next
+    }
+    # Subset rows where the flag == 1
+    subset_df <- df[df[[subset_type]] == 1, c("entrezgene_id", "direction_value")]
+    # If no rows, skip
+    if (nrow(subset_df) == 0) {
+      message(sprintf("No rows with %s == 1 in %s; skipping.", subset_type, day_label))
+      next
+    }
+    # Build named numeric vector: values = direction_value, names = entrezgene_id
+    gene_data <- subset_df$direction_value
+    names(gene_data) <- as.character(subset_df$entrezgene_id)
+    
+    # Loop through pathways
+    for(pathway in pathway_ids) {
+      message(sprintf("Running pathview for %s, %s subset, pathway %s", day_label, subset_type, pathway))
+      tryCatch({
+        pathview(
+          gene.data = gene_data,
+          pathway.id = pathway,
+          species = "gga",
+          verbose = TRUE,
+          kegg.native = TRUE,
+          out.suffix = paste0(day_label, "_", subset_type),
+          limit = list(gene = 2, cpd = 1),
+          low = list(gene = "red", cpd = "blue"),
+          mid = list(gene = "gray", cpd = "gray"),
+          high = list(gene = "green", cpd = "yellow")
+        )
+      }, error = function(e) {
+        message(sprintf("Error in %s,%s,%s with kegg.native=TRUE: %s; retrying with kegg.native=FALSE", 
+                        day_label, subset_type, pathway, e$message))
+        # retry with kegg.native = FALSE
+        pathview(
+          gene.data = gene_data,
+          pathway.id = pathway,
+          species = "gga",
+          verbose = TRUE,
+          kegg.native = FALSE,
+          out.suffix = paste0(day_label, "_", subset_type, "_F"),
+          limit = list(gene = 2, cpd = 1),
+          low = list(gene = "red", cpd = "blue"),
+          mid = list(gene = "gray", cpd = "gray"),
+          high = list(gene = "green", cpd = "yellow")
+        )
+      })
+    }
+  }
+}
+
+```
+
+# 11. comparison of the pathways accross studies
+
+```{r}
+# Put your data.frames in a named list:
+df_list <- list(
+  day1 = combined_1_jackknife_gallus,
+  day2 = combined_2_jackknife_gallus,
+  day3 = combined_3_jackknife_gallus
+)
+
+# Define for each day which cluster columns to use:
+cluster_cols <- list(
+  day1 = c("jackknife", "huang", "campbell", "smith"),
+  day2 = c("jackknife", "huang", "campbell", "morris_2_3_2_1", "morris_2_2"),
+  day3 = c("jackknife", "huang", "campbell", "smith")
+)
+
+colors_custom <- c(
+  rgb(58, 170, 53, maxColorValue = 255),   # middengroen
+  rgb(188, 207, 0, maxColorValue = 255)    # lichtgroen
+)
+
+for(day in names(df_list)) {
+  df <- df_list[[day]]
+  cols <- cluster_cols[[day]]
+  
+  geneclusters <- lapply(cols, function(col) {
+    if (col %in% colnames(df)) {
+      ids <- df$entrezgene_id[df[[col]] == 1]
+      if (length(ids) > 0) return(as.character(ids))
+    }
+    NULL
+  })
+  names(geneclusters) <- cols
+  geneclusters <- geneclusters[!sapply(geneclusters, is.null)]
+  
+  if (length(geneclusters) == 0) {
+    message(sprintf("No valid clusters for %s; skipping.", day))
+    next
+  }
+  
+  cc <- compareCluster(
+    geneclusters,
+    fun          = "enrichKEGG",
+    organism     = "gga",
+    pvalueCutoff = 0.05
+  )
+  
+  long_title <- str_wrap(
+  "Overrepresented KEGG Pathways In Differentially Expressed Genes Three Days Post Infection",
+  width = 60
+  )
+  
+  p <- dotplot(cc) + 
+       #ggtitle(sprintf("KEGG enrichment: %s", day)) +
+      ggtitle(long_title) +
+       scale_fill_gradient(low = rgb(188, 207, 0, maxColorValue = 255),
+                            high = rgb(58, 170, 53, maxColorValue = 255)) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,          # center
+      size  = 14,           # shrink or enlarge
+      margin = margin(b = 10)  # give a little breathing room
+    )
+  )
+  
+  print(p)
+}
+
+
+```
