@@ -1,0 +1,1764 @@
+---
+title: "meta_analysis (Huang excluded)"
+author: "Killian"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Preparation
+## 1.1 Setting seed for reproducibility
+
+```{r}
+set.seed(42)
+```
+
+## 1.2 Loading packages
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
+library(edgeR)
+library(biomaRt)
+library(metapro)
+library(ggVennDiagram)
+library(UpSetR)
+library(DT)
+library(clusterProfiler)
+library(pathview)
+library(gage)
+library(gageData)
+library(grid)
+library(GO.db)
+library(patchwork)
+library(scales)
+```
+
+# 2. Preparation of the data
+## 2.1 Loading count data and metadata
+
+```{r}
+# Read pre-processed counts and metadata
+paired <- read.delim("counts_paired.txt", comment.char = "#", row.names = 1)
+single <- read.delim("counts_single.txt", comment.char = "#", row.names = 1)
+counts <- cbind(paired[, -(1:5)], single[rownames(paired), -(1:5)])
+colnames(counts) <- sub(".*\\.([ES]RR\\d+)_.*", "\\1", colnames(counts))
+metadata <- read.csv("metadata.csv", row.names = 1)
+
+# Reviewer-requested sensitivity analysis: Huang is dropped up front, so no
+# Huang sample enters filtering, normalisation, dispersion or testing.
+metadata <- metadata[metadata$study != "huang", ]
+
+# Order counts to match metadata
+counts <- counts[, metadata$Run]
+
+# Split counts by study
+campbell_counts <- counts[, metadata$Run[metadata$study == "campbell"], drop = FALSE]
+smith_counts    <- counts[, metadata$Run[metadata$study == "smith"],    drop = FALSE]
+morris_counts   <- counts[, metadata$Run[metadata$study == "morris"],   drop = FALSE]
+```
+
+## 2.2 Loading annotation
+
+```{r}
+ft <- read.delim("GCF_047663525.1_IASCAAS_PekinDuck_T2T_feature_table.txt",
+                 quote = "", stringsAsFactors = FALSE)
+annotation_data <- ft %>%
+  filter(X..feature == "gene") %>%
+  mutate(key = if_else(locus_tag != "" & !is.na(locus_tag), locus_tag, symbol)) %>%
+  transmute(key, symbol, GeneID, class, name, chromosome, start, end, strand) %>%
+  distinct() %>%
+  group_by(key) %>%
+  mutate(ensembl_gene_id = if_else(row_number() == 1, key,
+                                   paste0(key, "_", row_number() - 1))) %>%
+  ungroup() %>%
+  transmute(ensembl_gene_id,
+            external_gene_name = symbol,
+            entrezgene_id      = GeneID,
+            gene_biotype       = class,
+            description        = name,
+            chromosome, start, end, strand) %>%
+  as.data.frame()
+
+setdiff(rownames(counts), annotation_data$ensembl_gene_id)   # expect character(0)
+
+annotation_data <- annotation_data[match(rownames(counts), annotation_data$ensembl_gene_id), ]
+stopifnot(identical(rownames(counts), annotation_data$ensembl_gene_id))
+```
+## 2.3 Creating DGEList objects
+
+```{r}
+# Ensure metadata matches counts columns exactly
+metadata <- metadata %>%
+  filter(Run %in% colnames(counts)) %>%
+  .[match(colnames(counts), .$Run), ] %>%
+  mutate(sample_id = paste(dpi, treatment, biological_replicate, sep = "_"))
+
+# Full DGEList for initial QC
+y <- DGEList(counts = counts, samples = metadata)
+
+# Per-study DGELists
+campbell <- DGEList(counts = campbell_counts, samples = metadata %>% filter(study == "campbell"), genes = annotation_data)
+morris   <- DGEList(counts = morris_counts,   samples = metadata %>% filter(study == "morris"),   genes = annotation_data)
+smith    <- DGEList(counts = smith_counts,    samples = metadata %>% filter(study == "smith"),    genes = annotation_data)
+
+rm(campbell_counts, morris_counts, smith_counts)
+```
+
+# 3. Visualisation, filtering, normalisation
+## 3.1 Raw data PCA
+
+```{r, message=FALSE, warning=FALSE}
+# Log-CPM PCA on all samples
+# Exclude Morris timepoints that are not part of the meta-analysis design
+# (0.5 and 5 dpi only exist in the original Morris study and were never
+# carried into the DE contrasts in section 4) so they neither appear in the
+# plots below nor influence the computed principal components. This filtered
+# copy is local to this chunk; the `morris` DGEList used downstream (3.2+)
+# is untouched.
+y_pca <- y[, !(y$samples$dpi %in% c(0.5, 5))]
+
+pca_res <- prcomp(t(cpm(y_pca, log = TRUE)), scale. = TRUE)
+pca <- merge(
+  transform(as.data.frame(pca_res$x), Run = rownames(pca_res$x)),
+  y_pca$samples,
+  by = "Run"
+)
+
+# Add display labels
+pca$study <- stringr::str_to_title(pca$study)
+pca$treatment_label <- case_when(
+  pca$study %in% c("Smith", "Campbell")        & pca$treatment == "HP"      ~ "Clade 1",
+  pca$study == "Morris"                        & pca$treatment == "HP_2.2"  ~ "Clade 2.2.2.1",
+  pca$study == "Morris"                        & pca$treatment == "HP_2.3.2.1" ~ "Clade 2.3.2.1a",
+  pca$treatment == "control"                                                 ~ "Control",
+  TRUE                                                                       ~ pca$treatment
+)
+
+# PCA coloured by study, shaped by treatment
+p_pca1 <- ggplot(pca, aes(PC1, PC2, color = study, shape = treatment_label)) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  labs(x = "PC1", y = "PC2", shape = "Treatment", color = "Study") +
+  theme_minimal()
+
+print(p_pca1)
+ggsave("supplementary_figure_1_noHuang.png", p_pca1, width = 12, height = 8, dpi = 300)
+
+# PCA coloured by DPI, faceted by treatment
+ggplot(pca, aes(PC1, PC2, color = factor(dpi), shape = treatment_label)) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  facet_wrap(~ treatment_label) +
+  scale_color_viridis_d() +
+  labs(x = "PC1", y = "PC2", shape = "Treatment", color = "DPI") +
+  theme_minimal()
+
+# Per-study PCA
+for (s in unique(pca$study)) {
+  pca_s <- na.omit(subset(pca, study == s))
+  p <- ggplot(pca_s, aes(PC1, PC2, color = factor(dpi), shape = treatment_label)) +
+    geom_point(size = 3) +
+    scale_color_viridis_d() +
+    labs(title = paste("PCA Plot - Study:", s), x = "PC1", y = "PC2") +
+    theme_minimal()
+  if (nrow(pca_s) >= 3) p <- p + stat_ellipse()
+  print(p)
+}
+
+rm(pca_res, pca, p, pca_s, s, p_pca1, y_pca)
+```
+
+## 3.2 Sum technical replicates (Morris) and verify
+
+```{r, message=FALSE}
+cat("Morris dimensions before summing tech reps:", dim(morris), "\n")
+morris <- sumTechReps(morris, ID = morris$samples$sample_id)
+cat("Morris dimensions after summing tech reps:",  dim(morris), "\n")
+
+# Quick PCA to verify
+log_cpm <- cpm(morris, log = TRUE)
+log_cpm <- log_cpm[apply(log_cpm, 1, var) > 0, ]
+pca_morris <- data.frame(prcomp(t(log_cpm), scale. = TRUE)$x[, 1:2], morris$samples)
+
+ggplot(pca_morris, aes(PC1, PC2, color = factor(dpi), shape = treatment)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  scale_color_viridis_d() +
+  labs(title = "PCA Plot of Morris Dataset (post tech-rep sum)", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+rm(log_cpm, pca_morris)
+```
+
+## 3.3 Filtering low-count genes
+
+```{r}
+filter_and_report <- function(dge) {
+  cat("Before filtering:", dim(dge), "\n")
+  keep <- filterByExpr(dge, group = dge$samples$group)
+  dge  <- dge[keep, , keep.lib.sizes = FALSE]
+  cat("After filtering: ", dim(dge), "\n")
+  dge
+}
+
+cat("campbell\n"); campbell <- filter_and_report(campbell)
+cat("morris\n");   morris   <- filter_and_report(morris)
+cat("smith\n");    smith    <- filter_and_report(smith)
+
+rm(filter_and_report)
+```
+
+## 3.4 Normalising
+
+```{r}
+campbell <- normLibSizes(campbell)
+morris   <- normLibSizes(morris)
+smith    <- normLibSizes(smith)
+```
+
+## 3.5 PCA after normalisation
+
+```{r, message=FALSE, warning=FALSE}
+plotPCA <- function(dge, title, exclude_dpi = NULL) {
+  # exclude_dpi lets us drop timepoints that were never carried into the DE
+  # contrasts (section 4) from the PCA plot only. Subsetting happens on a
+  # local copy of `dge` inside this function, so the `campbell`/`morris`/
+  # `smith` DGELists used downstream for dispersion estimation and
+  # differential expression are never modified.
+  if (!is.null(exclude_dpi)) {
+    dge <- dge[, !(dge$samples$dpi %in% exclude_dpi)]
+  }
+  log_cpm <- cpm(dge, log = TRUE)
+  log_cpm <- log_cpm[apply(log_cpm, 1, var) > 0, ]
+  pca <- data.frame(prcomp(t(log_cpm), scale. = TRUE)$x[, 1:2], dge$samples)
+  ggplot(pca, aes(PC1, PC2, color = factor(dpi), shape = factor(treatment))) +
+    geom_point(size = 3) +
+    stat_ellipse(aes(group = interaction(dpi, treatment)), level = 0.95, linetype = "dashed") +
+    ggtitle(title) +
+    labs(color = "dpi", shape = "treatment") +
+    theme_minimal()
+}
+
+# Print each per-study PCA into the knitted document, and additionally save
+# a high-resolution PNG (300 dpi), same convention as the UpSet plots in
+# section 5.6.
+save_pca_plot <- function(p, basename, width_in = 8, height_in = 6) {
+  print(p)
+  ggsave(paste0(basename, ".png"), p, width = width_in, height = height_in, dpi = 300)
+}
+
+save_pca_plot(plotPCA(campbell, "Campbell: PCA Plot"), "supplementary_figure_2a_campbell_pca_noHuang")
+save_pca_plot(plotPCA(morris,   "Morris: PCA Plot", exclude_dpi = c(0.5, 5)),
+              "supplementary_figure_2b_morris_pca_noHuang")
+save_pca_plot(plotPCA(smith,    "Smith: PCA Plot"),    "supplementary_figure_2c_smith_pca_noHuang")
+
+rm(y, counts, plotPCA, save_pca_plot)
+```
+
+# 4. Differential expression analysis
+## 4.1 Estimate dispersion and fit model
+
+```{r}
+make_design <- function(dge) {
+  d <- model.matrix(~ 0 + group, data = dge$samples)
+  colnames(d) <- gsub("group", "", colnames(d))
+  d
+}
+
+design_campbell <- make_design(campbell)
+campbell <- estimateDisp(campbell, design_campbell)
+fit_campbell <- glmFit(campbell, design_campbell)
+
+design_smith <- make_design(smith)
+smith <- estimateDisp(smith, design_smith)
+fit_smith <- glmFit(smith, design_smith)
+
+design_morris <- make_design(morris)
+morris <- estimateDisp(morris, design_morris)
+fit_morris <- glmFit(morris, design_morris)
+
+# No borrowed dispersion is needed here: every remaining study has replicates,
+# so each common.dispersion is estimated from its own data.
+print(morris$common.dispersion)
+print(campbell$common.dispersion)
+print(smith$common.dispersion)
+
+rm(make_design)
+```
+
+## 4.2 Differential expression
+
+```{r}
+contrasts_campbell <- makeContrasts(
+  HPvsControl_1dpi = HP_1 - control_1,
+  HPvsControl_2dpi = HP_2 - control_2,
+  HPvsControl_3dpi = HP_3 - control_3,
+  levels = design_campbell
+)
+campbell_1 <- topTags(glmLRT(fit_campbell, contrast = contrasts_campbell[, "HPvsControl_1dpi"]), n = Inf)$table
+campbell_2 <- topTags(glmLRT(fit_campbell, contrast = contrasts_campbell[, "HPvsControl_2dpi"]), n = Inf)$table
+campbell_3 <- topTags(glmLRT(fit_campbell, contrast = contrasts_campbell[, "HPvsControl_3dpi"]), n = Inf)$table
+
+contrasts_smith <- makeContrasts(
+  HPvsControl_1dpi = HP_1 - control_1,
+  HPvsControl_3dpi = HP_3 - control_3,
+  levels = design_smith
+)
+smith_1 <- topTags(glmLRT(fit_smith, contrast = contrasts_smith[, "HPvsControl_1dpi"]), n = Inf)$table
+smith_3 <- topTags(glmLRT(fit_smith, contrast = contrasts_smith[, "HPvsControl_3dpi"]), n = Inf)$table
+
+contrasts_morris <- makeContrasts(
+  HPvsControl_2.2_2dpi   = HP_2.2_2   - control_0,
+  HPvsControl_2.3.2.1_2dpi = HP_2.3.2.1_2 - control_0,
+  levels = design_morris
+)
+morris_2.2_2     <- topTags(glmLRT(fit_morris, contrast = contrasts_morris[, "HPvsControl_2.2_2dpi"]),     n = Inf)$table
+morris_2.3.2.1_2 <- topTags(glmLRT(fit_morris, contrast = contrasts_morris[, "HPvsControl_2.3.2.1_2dpi"]), n = Inf)$table
+```
+
+## 4.3 Summary of differentially expressed genes per study
+
+```{r}
+# Number of up/downregulated genes (FDR < 0.05) per study and timepoint
+deg_summary <- function(study_name, dpi, df, fdr_col = "FDR", logfc_col = "logFC", threshold = 0.05) {
+  data.frame(
+    Study = study_name,
+    DPI = dpi,
+    Upregulated = sum(df[[fdr_col]] < threshold & df[[logfc_col]] > 0, na.rm = TRUE),
+    Downregulated = sum(df[[fdr_col]] < threshold & df[[logfc_col]] < 0, na.rm = TRUE)
+  )
+}
+
+deg_counts <- bind_rows(
+  deg_summary("Campbell 2021", 1, campbell_1),
+  deg_summary("Campbell 2021", 2, campbell_2),
+  deg_summary("Campbell 2021", 3, campbell_3),
+  deg_summary("Smith 2015",    1, smith_1),
+  deg_summary("Smith 2015",    3, smith_3),
+  deg_summary("Morris 2023 (2.2.2.1)",  2, morris_2.2_2),
+  deg_summary("Morris 2023 (2.3.2.1a)", 2, morris_2.3.2.1_2)
+) %>%
+  mutate(Total = Upregulated + Downregulated) %>%
+  arrange(DPI, Study)
+
+knitr::kable(deg_counts,
+             caption = "Number of upregulated and downregulated genes (FDR < 0.05) per study and day post infection (Huang excluded)")
+
+rm(deg_summary)
+```
+
+## 4.4 Venn diagrams
+
+```{r}
+# Helper: gene IDs passing a criterion
+sig_genes <- function(df, col, threshold = 0.05, direction = NULL) {
+  mask <- df[[col]] <= threshold
+  if (!is.null(direction)) mask <- mask & (if (direction == "up") df$logFC > 0 else df$logFC < 0)
+  rownames(df)[mask]
+}
+
+# P-value Venns
+ggVennDiagram(list(
+  `Morris 2.2 2dpi`   = sig_genes(morris_2.2_2,     "PValue"),
+  `Morris 2.3.2.1 2dpi` = sig_genes(morris_2.3.2.1_2, "PValue"),
+  `Campbell 2dpi`     = sig_genes(campbell_2,        "PValue")
+)) + scale_fill_gradient(low = "white", high = "blue")
+
+ggVennDiagram(list(
+  `Campbell 1dpi` = sig_genes(campbell_1, "PValue"),
+  `Smith 1dpi`    = sig_genes(smith_1,    "PValue")
+)) + scale_fill_gradient(low = "white", high = "red")
+
+ggVennDiagram(list(
+  `Campbell 3dpi` = sig_genes(campbell_3, "PValue"),
+  `Smith 3dpi`    = sig_genes(smith_3,    "PValue")
+)) + scale_fill_gradient(low = "white", high = "purple")
+
+# FDR Venns
+ggVennDiagram(list(
+  `Morris 2.2 2dpi`     = sig_genes(morris_2.2_2,     "FDR"),
+  `Morris 2.3.2.1 2dpi` = sig_genes(morris_2.3.2.1_2, "FDR"),
+  `Campbell 2dpi`       = sig_genes(campbell_2,        "FDR")
+)) + scale_fill_gradient(low = "white", high = "blue")
+
+ggVennDiagram(list(
+  `Campbell 1dpi` = sig_genes(campbell_1, "FDR"),
+  `Smith 1dpi`    = sig_genes(smith_1,    "FDR")
+)) + scale_fill_gradient(low = "white", high = "red")
+
+ggVennDiagram(list(
+  `Campbell 3dpi` = sig_genes(campbell_3, "FDR"),
+  `Smith 3dpi`    = sig_genes(smith_3,    "FDR")
+)) + scale_fill_gradient(low = "white", high = "purple")
+
+# FDR up-regulated Venns
+ggVennDiagram(list(
+  `Morris 2.2 2dpi`     = sig_genes(morris_2.2_2,     "FDR", direction = "up"),
+  `Morris 2.3.2.1 2dpi` = sig_genes(morris_2.3.2.1_2, "FDR", direction = "up"),
+  `Campbell 2dpi`       = sig_genes(campbell_2,        "FDR", direction = "up")
+)) + scale_fill_gradient(low = "white", high = "blue")
+
+ggVennDiagram(list(
+  `Campbell 1dpi` = sig_genes(campbell_1, "FDR", direction = "up"),
+  `Smith 1dpi`    = sig_genes(smith_1,    "FDR", direction = "up")
+)) + scale_fill_gradient(low = "white", high = "red")
+
+ggVennDiagram(list(
+  `Campbell 3dpi` = sig_genes(campbell_3, "FDR", direction = "up"),
+  `Smith 3dpi`    = sig_genes(smith_3,    "FDR", direction = "up")
+)) + scale_fill_gradient(low = "white", high = "purple")
+
+# FDR down-regulated Venns
+ggVennDiagram(list(
+  `Morris 2.2 2dpi`     = sig_genes(morris_2.2_2,     "FDR", direction = "down"),
+  `Morris 2.3.2.1 2dpi` = sig_genes(morris_2.3.2.1_2, "FDR", direction = "down"),
+  `Campbell 2dpi`       = sig_genes(campbell_2,        "FDR", direction = "down")
+)) + scale_fill_gradient(low = "white", high = "blue")
+
+ggVennDiagram(list(
+  `Campbell 1dpi` = sig_genes(campbell_1, "FDR", direction = "down"),
+  `Smith 1dpi`    = sig_genes(smith_1,    "FDR", direction = "down")
+)) + scale_fill_gradient(low = "white", high = "red")
+
+ggVennDiagram(list(
+  `Campbell 3dpi` = sig_genes(campbell_3, "FDR", direction = "down"),
+  `Smith 3dpi`    = sig_genes(smith_3,    "FDR", direction = "down")
+)) + scale_fill_gradient(low = "white", high = "purple")
+
+rm(sig_genes)
+```
+
+# 5. P-value combination and sensitivity analysis
+## 5.1 P-value distributions under the null
+
+```{r}
+for (df_name in c("smith_1", "smith_3",
+                  "campbell_1", "campbell_2", "campbell_3",
+                  "morris_2.3.2.1_2", "morris_2.2_2")) {
+  hist(get(df_name)$PValue, 20, main = df_name, xlab = "P-value")
+}
+```
+
+## 5.2 Meta-analysis function and p-value combination
+
+```{r}
+metaAnalysis <- function(study_list, study_names, weights) {
+  common_genes <- Reduce(intersect, lapply(study_list, rownames))
+  gene_name_map <- setNames(annotation_data$external_gene_name, annotation_data$ensembl_gene_id)
+
+  out <- data.frame(gene = common_genes,
+                    p_combined = NA_real_,
+                    eff_direction = NA_character_,
+                    same_direction = NA,
+                    studies_included = NA_character_,
+                    stringsAsFactors = FALSE)
+  for (s in study_names) {
+    out[[paste0("logFC_",  s)]] <- NA_real_
+    out[[paste0("PValue_", s)]] <- NA_real_
+    out[[paste0("FDR_",    s)]] <- NA_real_
+  }
+
+  for (i in seq_along(common_genes)) {
+    gene <- common_genes[i]
+    p_values <- fc_values <- numeric()
+    studies  <- character()
+
+    for (j in seq_along(study_list)) {
+      df    <- study_list[[j]]
+      study <- study_names[j]
+      out[i, paste0("logFC_",  study)] <- df[gene, "logFC"]
+      out[i, paste0("PValue_", study)] <- df[gene, "PValue"]
+      out[i, paste0("FDR_",    study)] <- df[gene, "FDR"]
+      p_values  <- c(p_values,  df[gene, "PValue"])
+      fc_values <- c(fc_values, df[gene, "logFC"])
+      studies   <- c(studies,   study)
+    }
+
+    wf <- wFisher(p = p_values, weight = weights,
+                  is.onetail = FALSE, eff.sign = sign(fc_values))
+    out$p_combined[i]     <- wf$p
+    out$eff_direction[i]  <- wf$overall.eff.direction
+    out$same_direction[i] <- (all(fc_values > 0) || all(fc_values < 0))
+    out$studies_included[i] <- paste(studies, collapse = ", ")
+  }
+
+  out$gene_name    <- gene_name_map[out$gene]
+  out$FDR_combined <- p.adjust(out$p_combined, method = "BH")
+  col_order <- c("gene", "gene_name", "p_combined", "FDR_combined",
+                 "same_direction", "studies_included",
+                 setdiff(names(out), c("gene", "gene_name", "p_combined",
+                                       "FDR_combined", "same_direction",
+                                       "studies_included")))
+  out[order(out$FDR_combined), col_order]
+}
+
+combined_1 <- metaAnalysis(
+  study_list   = list(campbell_1, smith_1),
+  study_names  = c("campbell_1", "smith_1"),
+  weights      = c(4, 3)
+)
+combined_2 <- metaAnalysis(
+  study_list   = list(morris_2.2_2, morris_2.3.2.1_2, campbell_2),
+  study_names  = c("morris_2.2_2", "morris_2.3.2.1_2", "campbell_2"),
+  weights      = c(3, 3, 4)
+)
+combined_3 <- metaAnalysis(
+  study_list   = list(campbell_3, smith_3),
+  study_names  = c("campbell_3", "smith_3"),
+  weights      = c(4, 3)
+)
+print(head(combined_3))
+```
+
+## 5.3 Jackknife sampling (day 2 only)
+
+```{r}
+jackknife_meta2 <- function(study_list, study_names, weights) {
+  setNames(
+    lapply(seq_along(study_list), function(i) {
+      metaAnalysis(study_list[-i], study_names[-i], weights[-i])
+    }),
+    paste0("jackknife_excluding_", study_names)
+  )
+}
+
+# Only day 2 has three inputs, so only day 2 supports a leave-one-out.
+jackknife_results_2 <- jackknife_meta2(
+  study_list  = list(morris_2.2_2 = morris_2.2_2, morris_2.3.2.1_2 = morris_2.3.2.1_2,
+                     campbell_2 = campbell_2),
+  study_names = c("morris_2.2_2", "morris_2.3.2.1_2", "campbell_2"),
+  weights     = c(3, 3, 4)
+)
+```
+
+## 5.4 Build robustness flags
+
+`robust` is the flag every later section uses. With Huang gone, days 1 and 3
+have only two studies, so a leave-one-out is not informative there; `robust` is
+instead the intersection of the two per-study DEG sets, requiring concordant
+direction and significance in the combination. Day 2 retains three inputs and
+keeps the leave-one-out robust.
+
+```{r}
+# Days 1 and 3: intersection of Campbell and Smith
+add_flags_1_3 <- function(combined, day_suffix) {
+  combined %>%
+    mutate(
+      combined = as.integer(FDR_combined < 0.05),
+      campbell = as.integer(.data[[paste0("FDR_campbell_", day_suffix)]] < 0.05),
+      smith    = as.integer(.data[[paste0("FDR_smith_",    day_suffix)]] < 0.05),
+      robust   = as.integer(campbell == 1 & smith == 1 & same_direction & combined == 1)
+    )
+}
+
+combined_1_jackknife <- add_flags_1_3(combined_1, day_suffix = 1)
+combined_3_jackknife <- add_flags_1_3(combined_3, day_suffix = 3)
+
+# How often does the FDR_combined term actually exclude anything?
+for (d in c(1, 3)) {
+  df <- get(paste0("combined_", d, "_jackknife"))
+  cat(sprintf("day %d: %d genes significant in both studies with concordant direction, %d of which fail FDR_combined\n",
+              d,
+              sum(df$campbell == 1 & df$smith == 1 & df$same_direction, na.rm = TRUE),
+              sum(df$campbell == 1 & df$smith == 1 & df$same_direction & df$combined == 0, na.rm = TRUE)))
+}
+
+# Day 2 has 3 studies (two Morris sub-strains + Campbell): true leave-one-out
+combined_2_jackknife <- combined_2 %>%
+  left_join(
+    jackknife_results_2$jackknife_excluding_campbell_2 %>%
+      dplyr::select(gene,
+             p_combined_no_campbell   = p_combined,
+             FDR_combined_no_campbell = FDR_combined,
+             same_direction_no_campbell = same_direction,
+             eff_direction_no_campbell  = eff_direction),
+    by = "gene"
+  ) %>%
+  left_join(
+    jackknife_results_2$`jackknife_excluding_morris_2.3.2.1_2` %>%
+      dplyr::select(gene,
+             p_combined_no_morris_2_3_2_1   = p_combined,
+             FDR_combined_no_morris_2_3_2_1 = FDR_combined,
+             same_direction_no_morris_2_3_2_1 = same_direction,
+             eff_direction_no_morris_2_3_2_1  = eff_direction),
+    by = "gene"
+  ) %>%
+  left_join(
+    jackknife_results_2$`jackknife_excluding_morris_2.2_2` %>%
+      dplyr::select(gene,
+             p_combined_no_morris_2_2   = p_combined,
+             FDR_combined_no_morris_2_2 = FDR_combined,
+             same_direction_no_morris_2_2 = same_direction,
+             eff_direction_no_morris_2_2  = eff_direction),
+    by = "gene"
+  ) %>%
+  mutate(
+    robust = as.integer(
+      eff_direction_no_campbell == eff_direction_no_morris_2_3_2_1 &
+      eff_direction_no_campbell == eff_direction_no_morris_2_2 &
+      FDR_combined_no_campbell       < 0.05 &
+      FDR_combined_no_morris_2_3_2_1 < 0.05 &
+      FDR_combined_no_morris_2_2     < 0.05
+    ),
+    combined       = as.integer(FDR_combined < 0.05),
+    campbell       = as.integer(FDR_campbell_2     < 0.05),
+    morris_2_3_2_1 = as.integer(`FDR_morris_2.3.2.1_2` < 0.05),
+    morris_2_2     = as.integer(`FDR_morris_2.2_2`     < 0.05),
+    robust         = robust
+  )
+
+rm(add_flags_1_3, d, df)
+```
+
+## 5.5 UpSetR plots
+
+```{r}
+# Descriptive set labels used for all UpSet plots in this section and the
+# next; original column names are restored at the end of section 5.6 so
+# downstream filtering code (section 6+) keeps working
+orig1 <- colnames(combined_1_jackknife)
+orig2 <- colnames(combined_2_jackknife)
+orig3 <- colnames(combined_3_jackknife)
+
+rename_cols <- function(df, map) {
+  hit <- names(df) %in% names(map)
+  names(df)[hit] <- map[names(df)[hit]]
+  df
+}
+
+study_labels <- c(
+  robust = "Robust", combined = "Combined",
+  smith = "Smith 2015", campbell = "Campbell 2021",
+  morris_2_2 = "Morris 2023 (2.2.2.1)", morris_2_3_2_1 = "Morris 2023 (2.3.2.1a)"
+)
+
+combined_1_jackknife <- rename_cols(combined_1_jackknife, study_labels)
+combined_2_jackknife <- rename_cols(combined_2_jackknife, study_labels)
+combined_3_jackknife <- rename_cols(combined_3_jackknife, study_labels)
+
+upset(combined_1_jackknife, sets = c("Smith 2015", "Campbell 2021", "Combined"))
+upset(combined_2_jackknife, sets = c("Campbell 2021", "Morris 2023 (2.2.2.1)", "Morris 2023 (2.3.2.1a)", "Combined"))
+upset(combined_3_jackknife, sets = c("Smith 2015", "Campbell 2021", "Combined"))
+
+upset(combined_1_jackknife, sets = c("Robust", "Smith 2015", "Campbell 2021"))
+upset(combined_2_jackknife, sets = c("Robust", "Campbell 2021", "Morris 2023 (2.2.2.1)", "Morris 2023 (2.3.2.1a)"))
+upset(combined_3_jackknife, sets = c("Robust", "Smith 2015", "Campbell 2021"))
+```
+
+## 5.6 UpSetR with combined flag (saved for publication)
+
+```{r}
+stopifnot(all(c("Robust","Smith 2015","Campbell 2021","Combined") %in% names(combined_1_jackknife)))
+
+# Print each plot into the knitted document, and additionally save a
+# high-resolution PNG (300 dpi) and a vector PDF, suitable for journal
+# submission
+save_upset <- function(df, sets, basename, width_in = 10, height_in = 7) {
+  print(upset(df, sets = sets))
+
+  png(paste0(basename, ".png"), width = width_in, height = height_in, units = "in", res = 300)
+  print(upset(df, sets = sets))
+  dev.off()
+
+  pdf(paste0(basename, ".pdf"), width = width_in, height = height_in)
+  print(upset(df, sets = sets))
+  dev.off()
+}
+
+save_upset(combined_1_jackknife,
+           c("Robust", "Smith 2015", "Campbell 2021", "Combined"),
+           "upset_combined_1_noHuang")
+save_upset(combined_2_jackknife,
+           c("Robust", "Campbell 2021", "Morris 2023 (2.2.2.1)", "Morris 2023 (2.3.2.1a)", "Combined"),
+           "upset_combined_2_noHuang")
+save_upset(combined_3_jackknife,
+           c("Robust", "Smith 2015", "Campbell 2021", "Combined"),
+           "upset_combined_3_noHuang")
+
+# Restore original column names so downstream code (sections 6+) keeps
+# working with the original snake_case names
+colnames(combined_1_jackknife) <- orig1
+colnames(combined_2_jackknife) <- orig2
+colnames(combined_3_jackknife) <- orig3
+rm(orig1, orig2, orig3, rename_cols, study_labels, save_upset)
+```
+
+## 5.7 Robust-positive gene counts by direction
+
+```{r}
+# Number of robust genes (FDR_combined < 0.05 with a consistent effect
+# direction: on day 2 this is across every leave-one-study-out iteration; on
+# days 1 and 3, agreement between the two remaining studies), split by
+# direction, per day
+robust_direction_summary <- function(dpi, df) {
+  data.frame(
+    DPI = dpi,
+    Upregulated   = sum(df$robust == 1 & df$eff_direction == "+", na.rm = TRUE),
+    Downregulated = sum(df$robust == 1 & df$eff_direction == "-", na.rm = TRUE)
+  )
+}
+
+robust_direction_counts <- bind_rows(
+  robust_direction_summary(1, combined_1_jackknife),
+  robust_direction_summary(2, combined_2_jackknife),
+  robust_direction_summary(3, combined_3_jackknife)
+) %>%
+  mutate(Total = Upregulated + Downregulated)
+
+knitr::kable(robust_direction_counts,
+             caption = "Number of robust genes (FDR < 0.05, consistent direction) by direction, per day post infection (Huang excluded)")
+
+rm(robust_direction_summary)
+```
+
+# 6. Interactive datatables
+## 6.0 Add gene descriptions to all combined tables
+
+```{r}
+# All datatables below (6.1-6.9) come from combined_X_jackknife. Those
+# dataframes originally only carried "gene" (ensembl_gene_id) and
+# "gene_name" (symbol) as identifier columns, so several of the raw tables
+# effectively repeated the gene twice with no human-readable description.
+# Add the annotation "description" once here, right after "gene", so every
+# interactive table below shows it consistently as the second column.
+add_description <- function(df) {
+  df %>%
+    left_join(annotation_data %>% dplyr::select(gene = ensembl_gene_id, description),
+              by = "gene") %>%
+    relocate(description, .after = gene)
+}
+
+combined_1_jackknife <- add_description(combined_1_jackknife)
+combined_2_jackknife <- add_description(combined_2_jackknife)
+combined_3_jackknife <- add_description(combined_3_jackknife)
+
+rm(add_description)
+```
+
+## 6.1 Top 20 differentially expressed genes (robust) per day
+
+```{r}
+# Top 20 robust DEGs per day, ranked by the combined FDR
+top20_robust <- function(df) {
+  df %>%
+    filter(robust == 1) %>%
+    arrange(FDR_combined) %>%
+    slice_head(n = 20) %>%
+    transmute(
+      Gene = if_else(!is.na(gene_name) & gene_name != "", gene_name, gene),
+      Description = description,
+      FDR = signif(FDR_combined, 3),
+      Direction = if_else(eff_direction == "+", "Up", "Down")
+    )
+}
+
+datatable(top20_robust(combined_1_jackknife), rownames = FALSE,
+          caption = "Top 20 robust differentially expressed genes - 1 dpi (Huang excluded)")
+datatable(top20_robust(combined_2_jackknife), rownames = FALSE,
+          caption = "Top 20 robust differentially expressed genes - 2 dpi (Huang excluded)")
+datatable(top20_robust(combined_3_jackknife), rownames = FALSE,
+          caption = "Top 20 robust differentially expressed genes - 3 dpi (Huang excluded)")
+
+rm(top20_robust)
+```
+
+## 6.2 Full tables
+
+```{r, message=FALSE}
+datatable(combined_1_jackknife)
+datatable(combined_2_jackknife)
+datatable(combined_3_jackknife)
+```
+
+## 6.3 Tables with genes found only by combined and not the different studies
+
+```{r}
+datatable(combined_1_jackknife %>% filter(combined == 1, smith != 1, campbell != 1))
+datatable(combined_2_jackknife %>% filter(combined == 1, morris_2_2 != 1, morris_2_3_2_1 != 1, campbell != 1))
+datatable(combined_3_jackknife %>% filter(combined == 1, smith != 1, campbell != 1))
+```
+
+## 6.4 Tables with genes found by combined
+
+```{r}
+datatable(combined_1_jackknife %>% filter(combined == 1))
+datatable(combined_2_jackknife %>% filter(combined == 1))
+datatable(combined_3_jackknife %>% filter(combined == 1))
+```
+
+## 6.5 Tables with genes found by all studies and combined
+
+```{r}
+datatable(combined_1_jackknife %>% filter(combined == 1, smith == 1, campbell == 1))
+datatable(combined_2_jackknife %>% filter(combined == 1, morris_2_2 == 1, morris_2_3_2_1 == 1, campbell == 1))
+datatable(combined_3_jackknife %>% filter(combined == 1, smith == 1, campbell == 1))
+```
+
+## 6.6 Tables with robust genes not found by the individual studies
+
+```{r}
+datatable(combined_1_jackknife %>% filter(robust == 1, smith != 1, campbell != 1))
+datatable(combined_2_jackknife %>% filter(robust == 1, morris_2_2 != 1, morris_2_3_2_1 != 1, campbell != 1))
+datatable(combined_3_jackknife %>% filter(robust == 1, smith != 1, campbell != 1))
+```
+
+## 6.7 Tables with robust genes
+
+```{r}
+datatable(combined_1_jackknife %>% filter(robust == 1))
+datatable(combined_2_jackknife %>% filter(robust == 1))
+datatable(combined_3_jackknife %>% filter(robust == 1))
+```
+
+## 6.8 Tables with robust genes found by all studies
+
+```{r}
+datatable(combined_1_jackknife %>% filter(robust == 1, smith == 1, campbell == 1))
+datatable(combined_2_jackknife %>% filter(robust == 1, morris_2_2 == 1, morris_2_3_2_1 == 1, campbell == 1))
+datatable(combined_3_jackknife %>% filter(robust == 1, smith == 1, campbell == 1))
+```
+
+## 6.9 Genes robust at all three days (rankable by FDR)
+
+```{r}
+# Genes with robust == 1 at every timepoint. Each day's combined FDR and
+# effect direction are kept as separate, clearly-named columns so the table
+# can be re-ranked by clicking any of the three FDR_combined_dayN headers.
+genes_all3_robust <- Reduce(intersect, list(
+  combined_1_jackknife$gene[combined_1_jackknife$robust == 1],
+  combined_2_jackknife$gene[combined_2_jackknife$robust == 1],
+  combined_3_jackknife$gene[combined_3_jackknife$robust == 1]
+))
+
+build_day_summary <- function(day_num, df, genes) {
+  df %>%
+    filter(gene %in% genes) %>%
+    dplyr::select(gene, gene_name, description, FDR_combined, eff_direction) %>%
+    rename_with(~ paste0(., "_day", day_num), c(FDR_combined, eff_direction))
+}
+
+d1 <- build_day_summary(1, combined_1_jackknife, genes_all3_robust)
+d2 <- build_day_summary(2, combined_2_jackknife, genes_all3_robust) %>%
+  dplyr::select(-gene_name, -description)
+d3 <- build_day_summary(3, combined_3_jackknife, genes_all3_robust) %>%
+  dplyr::select(-gene_name, -description)
+
+robust_all_days <- d1 %>%
+  inner_join(d2, by = "gene") %>%
+  inner_join(d3, by = "gene")
+
+default_sort_col <- which(names(robust_all_days) == "FDR_combined_day1") - 1
+
+datatable(robust_all_days, rownames = FALSE,
+          caption = "Genes that are robust at 1, 2, and 3 dpi (Huang excluded) - click any FDR_combined_dayN column header to re-rank",
+          options = list(order = list(list(default_sort_col, "asc"))))
+
+rm(d1, d2, d3, build_day_summary, genes_all3_robust, default_sort_col)
+```
+
+# 7. Log fold-change bar plots
+## 7.1 Helper function and shared theme
+
+```{r}
+# Shared bar-plot helper to avoid repeating pivot+ggplot code
+barplot_logfc <- function(df, gene_col, logfc_cols, title,
+                          filter_expr = TRUE, n = 20) {
+  df %>%
+    filter(!is.na(gene_name) & gene_name != "", {{ filter_expr }}) %>%
+    slice_head(n = n) %>%
+    dplyr::select(all_of(c(gene_col, logfc_cols))) %>%
+    pivot_longer(-all_of(gene_col), names_to = "source", values_to = "logFC") %>%
+    ggplot(aes(x = .data[[gene_col]], y = logFC, fill = source)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = title, x = "Gene", y = "logFC") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## 7.2 Top 20 combined genes
+
+```{r}
+barplot_logfc(combined_1_jackknife, "gene_name",
+              c("logFC_campbell_1","logFC_smith_1"),
+              "Log Fold Changes for 1dpi",
+              filter_expr = combined == 1)
+
+barplot_logfc(combined_2_jackknife, "gene_name",
+              c("logFC_morris_2.2_2","logFC_morris_2.3.2.1_2","logFC_campbell_2"),
+              "Log Fold Changes for 2dpi",
+              filter_expr = combined == 1)
+
+barplot_logfc(combined_3_jackknife, "gene_name",
+              c("logFC_campbell_3","logFC_smith_3"),
+              "Log Fold Changes for 3dpi",
+              filter_expr = combined == 1)
+```
+
+## 7.3 Top 20 common combined genes (in all studies)
+
+```{r}
+barplot_logfc(combined_1_jackknife, "gene_name",
+              c("logFC_campbell_1","logFC_smith_1"),
+              "Log Fold Changes for 1dpi (all studies)",
+              filter_expr = combined == 1 & campbell == 1 & smith == 1)
+
+barplot_logfc(combined_2_jackknife, "gene_name",
+              c("logFC_morris_2.2_2","logFC_morris_2.3.2.1_2","logFC_campbell_2"),
+              "Log Fold Changes for 2dpi (all studies)",
+              filter_expr = combined == 1 & campbell == 1 & morris_2_3_2_1 == 1 & morris_2_2 == 1)
+
+barplot_logfc(combined_3_jackknife, "gene_name",
+              c("logFC_campbell_3","logFC_smith_3"),
+              "Log Fold Changes for 3dpi (all studies)",
+              filter_expr = combined == 1 & campbell == 1 & smith == 1)
+```
+
+## 7.4 Top 20 unique combined genes
+
+```{r}
+barplot_logfc(combined_1_jackknife, "gene_name",
+              c("logFC_campbell_1","logFC_smith_1"),
+              "Log Fold Changes for 1dpi (unique to combined)",
+              filter_expr = combined == 1 & campbell != 1 & smith != 1)
+
+barplot_logfc(combined_2_jackknife, "gene_name",
+              c("logFC_morris_2.2_2","logFC_morris_2.3.2.1_2","logFC_campbell_2"),
+              "Log Fold Changes for 2dpi (unique to combined)",
+              filter_expr = combined == 1 & campbell != 1 & morris_2_3_2_1 != 1 & morris_2_2 != 1)
+
+barplot_logfc(combined_3_jackknife, "gene_name",
+              c("logFC_campbell_3","logFC_smith_3"),
+              "Log Fold Changes for 3dpi (unique to combined)",
+              filter_expr = combined == 1 & campbell != 1 & smith != 1)
+```
+
+## 7.5 Top 20 robust genes
+
+```{r}
+barplot_logfc(combined_1_jackknife, "gene_name",
+              c("logFC_campbell_1","logFC_smith_1"),
+              "Log Fold Changes for 1dpi (robust)",
+              filter_expr = robust == 1)
+
+barplot_logfc(combined_2_jackknife, "gene_name",
+              c("logFC_morris_2.2_2","logFC_morris_2.3.2.1_2","logFC_campbell_2"),
+              "Log Fold Changes for 2dpi (robust)",
+              filter_expr = robust == 1)
+
+barplot_logfc(combined_3_jackknife, "gene_name",
+              c("logFC_campbell_3","logFC_smith_3"),
+              "Log Fold Changes for 3dpi (robust)",
+              filter_expr = robust == 1)
+```
+
+## 7.6 Top 20 robust × common
+
+```{r}
+barplot_logfc(combined_1_jackknife, "gene_name",
+              c("logFC_campbell_1","logFC_smith_1"),
+              "Log Fold Changes for 1dpi (robust, all studies)",
+              filter_expr = robust == 1 & campbell == 1 & smith == 1)
+
+barplot_logfc(combined_2_jackknife, "gene_name",
+              c("logFC_morris_2.2_2","logFC_morris_2.3.2.1_2","logFC_campbell_2"),
+              "Log Fold Changes for 2dpi (robust, all studies)",
+              filter_expr = robust == 1 & campbell == 1 & morris_2_3_2_1 == 1 & morris_2_2 == 1)
+
+barplot_logfc(combined_3_jackknife, "gene_name",
+              c("logFC_campbell_3","logFC_smith_3"),
+              "Log Fold Changes for 3dpi (robust, all studies)",
+              filter_expr = robust == 1 & campbell == 1 & smith == 1)
+```
+
+## 7.7 Top 20 robust unique genes
+
+```{r}
+barplot_logfc(combined_1_jackknife, "gene_name",
+              c("logFC_campbell_1","logFC_smith_1"),
+              "Log Fold Changes for 1dpi (robust unique)",
+              filter_expr = robust == 1 & campbell != 1 & smith != 1)
+
+barplot_logfc(combined_2_jackknife, "gene_name",
+              c("logFC_morris_2.2_2","logFC_morris_2.3.2.1_2","logFC_campbell_2"),
+              "Log Fold Changes for 2dpi (robust unique)",
+              filter_expr = robust == 1 & campbell != 1 & morris_2_3_2_1 != 1 & morris_2_2 != 1)
+
+barplot_logfc(combined_3_jackknife, "gene_name",
+              c("logFC_campbell_3","logFC_smith_3"),
+              "Log Fold Changes for 3dpi (robust unique)",
+              filter_expr = robust == 1 & campbell != 1 & smith != 1)
+
+rm(barplot_logfc)
+```
+
+## 7.8 Curated innate-immune gene panel
+
+```{r}
+# --- 7.8a Define the curated gene panel ---------------------------------
+# `match_col` = "id"     -> match against ensembl_gene_id (used for genes with
+#                            no reliable symbol in the duck annotation, so we
+#                            match on the LOC identifier directly)
+# `match_col` = "symbol" -> match against annotation_data$external_gene_name
+# NOTE: TNFa's identifier is unconfirmed ("maybe LOC139998842" per the
+# original request) - please verify this against the annotation before
+# relying on that bar; a warning will also print at knit time if it doesn't
+# resolve to anything.
+gene_panel <- data.frame(
+  label = c(
+    "IL6", "IFNa2 (LOC101798847)", "IFNb (LOC101796052)", "IL8",
+    "TNFa (LOC139998842)", "IL10", "IFNG", "RIGI", "MDA5 (IFIH1)",
+    "LGP2 (DHX58)", "MAVS", "IRF7", "OAS (LOC101800895)", "TRIM25",
+    "RNF125", "STING1", "TLR7", "TLR3", "TRIF (TICAM1)", "LSM14A",
+    "RSAD2", "NLRR3 (LRRN3)", "PKR (EIF2AK2)", "CCL19",
+    "MX (LOC101793492)", "IFITM3", "IFITM1"
+  ),
+  match_col = c(
+    "symbol", "id", "id", "symbol",
+    "id", "symbol", "symbol", "symbol", "symbol",
+    "symbol", "symbol", "symbol", "id", "symbol",
+    "symbol", "symbol", "symbol", "symbol", "symbol", "symbol",
+    "symbol", "symbol", "symbol", "symbol",
+    "id", "symbol", "symbol"
+  ),
+  match_value = c(
+    "IL6", "LOC101798847", "LOC101796052", "IL8",
+    "LOC139998842", "IL10", "IFNG", "RIGI", "IFIH1",
+    "DHX58", "MAVS", "IRF7", "LOC101800895", "TRIM25",
+    "RNF125", "STING1", "TLR7", "TLR3", "TICAM1", "LSM14A",
+    "RSAD2", "LRRN3", "EIF2AK2", "CCL19",
+    "LOC101793492", "IFITM3", "IFITM1"
+  ),
+  stringsAsFactors = FALSE
+)
+gene_panel$label <- factor(gene_panel$label, levels = gene_panel$label)
+
+# Resolve each panel entry to its ensembl_gene_id in the annotation
+resolve_panel_ids <- function(panel, annotation) {
+  panel$ensembl_gene_id <- NA_character_
+  for (i in seq_len(nrow(panel))) {
+    hit <- if (panel$match_col[i] == "id") {
+      annotation$ensembl_gene_id == panel$match_value[i]
+    } else {
+      !is.na(annotation$external_gene_name) & annotation$external_gene_name == panel$match_value[i]
+    }
+    ids <- unique(annotation$ensembl_gene_id[hit])
+    if (length(ids) == 0) {
+      warning("Gene panel: no annotation match for ", panel$label[i],
+              " (", panel$match_col[i], " = ", panel$match_value[i], ")")
+    } else {
+      if (length(ids) > 1) {
+        warning("Gene panel: multiple annotation matches for ", panel$label[i],
+                "; using the first (", ids[1], ")")
+      }
+      panel$ensembl_gene_id[i] <- ids[1]
+    }
+  }
+  panel
+}
+
+gene_panel <- resolve_panel_ids(gene_panel, annotation_data)
+```
+
+```{r}
+# --- 7.8b Weighted "Combined" logFC + combined significance --------------
+# metaAnalysis() (5.2) combines P-VALUES across studies via wFisher - it does
+# not produce a combined effect size. logFC_combined here is a WEIGHTED MEAN
+# of the per-study point estimates, using the exact same weights already
+# chosen for wFisher (4/3 for Campbell/Smith at 1&3dpi; 3/3/4 for Morris
+# 2.2/Morris 2.3.2.1/Campbell at 2dpi). This is a weighted average of point
+# estimates, NOT a variance-weighted meta-analytic effect size (that would
+# need a per-study SE, which isn't in the edgeR output).
+#
+# The Combined bar is flagged significant only when BOTH:
+#   (a) FDR_combined < 0.05 (the existing `combined` flag), AND
+#   (b) it is robust, i.e. the `robust` flag already computed in 5.4
+#       (concordant direction and FDR_combined < 0.05, either across every
+#       leave-one-study-out re-analysis on day 2, or between the two
+#       remaining studies on days 1 and 3)
+add_weighted_logfc <- function(df, study_cols, weights) {
+  w <- weights / sum(weights)
+  logfc_mat <- as.matrix(df[, study_cols])
+  df$logFC_combined <- as.numeric(logfc_mat %*% w)
+  df$combined_sig    <- as.integer(df$combined == 1 & df$robust == 1)
+  df
+}
+
+combined_1_jackknife <- add_weighted_logfc(
+  combined_1_jackknife,
+  c("logFC_campbell_1", "logFC_smith_1"),
+  c(4, 3)
+)
+combined_2_jackknife <- add_weighted_logfc(
+  combined_2_jackknife,
+  c("logFC_morris_2.2_2", "logFC_morris_2.3.2.1_2", "logFC_campbell_2"),
+  c(3, 3, 4)
+)
+combined_3_jackknife <- add_weighted_logfc(
+  combined_3_jackknife,
+  c("logFC_campbell_3", "logFC_smith_3"),
+  c(4, 3)
+)
+```
+
+```{r}
+# --- 7.8c Plotting helpers -------------------------------------------------
+# Colours: a fixed categorical palette (adjacent-pair colourblind-safe,
+# validated for bar charts), one hue per study/estimate, so the same colour
+# means the same study in every facet. "Combined" takes the next slot in the
+# same sequence.
+study_colors <- c(
+  "Campbell 2021"          = "#2a78d6",  # slot 1 - blue
+  "Smith 2015"              = "#1baf7a",  # slot 2 - aqua
+  "Morris 2023 (2.2.2.1)"   = "#eda100",  # slot 3 - yellow
+  "Morris 2023 (2.3.2.1a)"  = "#e87ba4",  # slot 4 - magenta
+  "Combined"                = "#008300"   # slot 5 - green
+)
+
+# Per-dpi study -> column map. Order here fixes both the legend order and
+# the left-to-right bar order within each gene's group; "Combined" always
+# comes last.
+study_cols_all <- list(
+  `1` = list(
+    "Campbell 2021" = list(logfc = "logFC_campbell_1", sig = "campbell"),
+    "Smith 2015"    = list(logfc = "logFC_smith_1",    sig = "smith"),
+    "Combined"      = list(logfc = "logFC_combined",   sig = "combined_sig")
+  ),
+  `2` = list(
+    "Campbell 2021"          = list(logfc = "logFC_campbell_2",        sig = "campbell"),
+    "Morris 2023 (2.2.2.1)"   = list(logfc = "logFC_morris_2.2_2",      sig = "morris_2_2"),
+    "Morris 2023 (2.3.2.1a)"  = list(logfc = "logFC_morris_2.3.2.1_2",  sig = "morris_2_3_2_1"),
+    "Combined"                = list(logfc = "logFC_combined",          sig = "combined_sig")
+  ),
+  `3` = list(
+    "Campbell 2021" = list(logfc = "logFC_campbell_3", sig = "campbell"),
+    "Smith 2015"    = list(logfc = "logFC_smith_3",    sig = "smith"),
+    "Combined"      = list(logfc = "logFC_combined",   sig = "combined_sig")
+  )
+)
+
+# Pivot the three per-dpi tables into one long data frame:
+# gene x dpi x study, keeping only genes significant in at least one
+# study/Combined at at least one dpi (same rule as before, applied once
+# across the merged figure so all three facets share one gene ordering).
+build_gene_panel_long <- function(df_list, panel, study_cols_all) {
+  long <- purrr::imap_dfr(df_list, function(df, dpi_num) {
+    cols <- study_cols_all[[dpi_num]]
+    purrr::imap_dfr(cols, function(cc, study_label) {
+      data.frame(
+        ensembl_gene_id = df$gene,
+        dpi_num         = dpi_num,
+        dpi_label       = paste0(dpi_num, " dpi"),
+        study           = study_label,
+        logFC           = df[[cc$logfc]],
+        significant     = df[[cc$sig]] == 1,
+        stringsAsFactors = FALSE
+      )
+    })
+  })
+
+  long <- long %>%
+    inner_join(panel %>% dplyr::select(ensembl_gene_id, label), by = "ensembl_gene_id") %>%
+    filter(!is.na(logFC))
+
+  keep_genes <- long %>%
+    group_by(label) %>%
+    summarise(any_sig = any(significant), .groups = "drop") %>%
+    filter(any_sig) %>%
+    pull(label)
+
+  gene_levels_used <- levels(panel$label)[levels(panel$label) %in% as.character(keep_genes)]
+
+  long %>%
+    filter(label %in% keep_genes) %>%
+    mutate(
+      label     = factor(as.character(label), levels = gene_levels_used),
+      dpi_label = factor(dpi_label, levels = c("1 dpi", "2 dpi", "3 dpi"))
+    )
+}
+
+# One faceted bar chart (rows = dpi). Bars are manually positioned (rather
+# than relying on ggplot's automatic dodge) so a non-significant bar can be
+# marked with a precisely-placed "+" just beyond its tip, instead of
+# being faded out - bars stay fully opaque and readable regardless of
+# significance.
+plot_gene_panel_faceted <- function(long, study_cols_all, study_colors,
+                                    bar_width = 0.85, gap = 0.06,
+                                    mark_offset = 0.35) {
+  gene_levels <- levels(long$label)
+
+  long <- long %>%
+    mutate(
+      gene_index = as.integer(label),
+      study_n    = lengths(study_cols_all[dpi_num]),
+      study_idx  = mapply(function(s, d) match(s, names(study_cols_all[[d]])),
+                          as.character(study), dpi_num),
+      slot_width = bar_width / study_n,
+      x_center   = gene_index + (study_idx - (study_n + 1) / 2) * slot_width,
+      xmin       = x_center - slot_width * (1 - gap) / 2,
+      xmax       = x_center + slot_width * (1 - gap) / 2,
+      # "+" sits just beyond the bar's tip - above for positive bars,
+      # below for negative ones - rather than inside the bar
+      mark_y     = ifelse(logFC >= 0, logFC + mark_offset, logFC - mark_offset),
+      study      = factor(study, levels = names(study_colors))
+    )
+
+  mark_layer <- function(colour, size) {
+    geom_text(data = function(d) dplyr::filter(d, !significant),
+              aes(x = x_center, y = mark_y), label = "+",
+              colour = colour, size = size, family = "sans", fontface = "bold")
+  }
+
+  ggplot(long) +
+    geom_rect(aes(xmin = xmin, xmax = xmax, ymin = pmin(0, logFC), ymax = pmax(0, logFC),
+                  fill = study),
+              colour = "grey20", linewidth = 0.2) +
+    mark_layer("grey15", 3.2) +
+    geom_hline(yintercept = 0, colour = "#c3c2b7", linewidth = 0.4) +
+    scale_fill_manual(values = study_colors, name = "Study / estimate", drop = FALSE) +
+    scale_x_continuous(breaks = seq_along(gene_levels), labels = gene_levels,
+                       expand = expansion(add = 0.6)) +
+    # scales = "fixed" (the default) so all three dpi panels share one
+    # y-axis range; axes = "all_y" forces every panel to draw its own
+    # y-axis tick labels even though the scale is shared (ggplot2 >= 3.5.0
+    # - upgrade ggplot2 if this argument errors on an older install)
+    facet_wrap(~ dpi_label, ncol = 1, scales = "fixed", axes = "all_y") +
+    labs(x = "Gene", y = expression(log[2]*"FC"),
+         caption = "+ = not significant (per-study: FDR ≥ 0.05; Combined: FDR ≥ 0.05 and/or not robust)") +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x        = element_text(angle = 45, hjust = 1),
+      axis.text.y        = element_text(size = 9),
+      strip.text         = element_text(face = "bold", size = 12, hjust = 0),
+      strip.background   = element_blank(),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.caption        = element_text(hjust = 0, size = 9, colour = "#52514e"),
+      legend.position     = "bottom"
+    )
+}
+```
+
+```{r, fig.width=13, fig.height=15}
+# --- 7.8d Build and render the combined figure -----------------------
+# One figure, faceted by dpi (clearly labelled per-facet - no overall title
+# needed), including a weighted "Combined" bar per gene. Printed into the
+# knitted HTML and saved as high-resolution PNG + vector PDF, same
+# convention as the rest of section 7.
+gene_panel_long <- build_gene_panel_long(
+  list(`1` = combined_1_jackknife, `2` = combined_2_jackknife, `3` = combined_3_jackknife),
+  gene_panel, study_cols_all
+)
+
+p_gene_panel_all <- plot_gene_panel_faceted(gene_panel_long, study_cols_all, study_colors)
+print(p_gene_panel_all)
+
+ggsave("gene_panel_all_dpi_noHuang.png", p_gene_panel_all, width = 13, height = 15, dpi = 300)
+ggsave("gene_panel_all_dpi_noHuang.pdf", p_gene_panel_all, width = 13, height = 15)
+
+rm(resolve_panel_ids, add_weighted_logfc, study_colors, study_cols_all,
+   build_gene_panel_long, plot_gene_panel_faceted, gene_panel_long,
+   gene_panel, p_gene_panel_all)
+```
+
+# 8. Gene Ontology (overrepresentation analysis)
+## 8.1 Annotation and helper
+
+```{r}
+# GO annotation from NCBI gene2go (replaces BioMart)
+g2g <- read.delim("duck_gene2go.tsv", quote = "") %>%
+  filter(!grepl("NOT", Qualifier))
+
+# Map GeneID -> symbol, so keys match rownames(counts) / df$gene
+entrez2sym <- setNames(annotation_data$ensembl_gene_id,
+                       as.character(annotation_data$entrezgene_id))
+
+go_tbl <- g2g %>%
+  mutate(gene = entrez2sym[as.character(GeneID)]) %>%
+  filter(!is.na(gene)) %>%
+  mutate(namespace_1003 = recode(Category,
+                                 "Process"   = "biological_process",
+                                 "Function"  = "molecular_function",
+                                 "Component" = "cellular_component")) %>%
+  distinct()
+
+TERM2GENE <- go_tbl %>% dplyr::select(go_id = GO_ID, gene) %>% distinct()
+TERM2NAME <- go_tbl %>% dplyr::select(go_id = GO_ID, name = GO_term) %>% distinct()
+
+# Background: genes actually tested in the meta-analysis
+plotgo <- function(target_genes, title = "GO Enrichment", universe = NULL) {
+  go_enrich <- enricher(gene = target_genes, TERM2GENE = TERM2GENE,
+                        TERM2NAME = TERM2NAME, universe = universe,
+                        pvalueCutoff = 0.05)
+  if (!is.null(go_enrich) && nrow(go_enrich@result) > 0)
+    print(barplot(go_enrich, showCategory = 20, title = title))
+  else
+    message("No enrichment found.")
+}
+```
+
+## 8.2 P-value combination genes
+
+```{r, fig.height=15, fig.width=15}
+for (day in 1:3) {
+  df <- get(paste0("combined_", day, "_jackknife"))
+  uni <- intersect(TERM2GENE$gene, df$gene)
+  goi <- df %>% filter(combined == 1) %>% pull(gene) %>% unique() %>% na.omit()
+  plotgo(goi, title = sprintf("DEGs after p-value combination, %d dpi", day),universe = uni)
+  goi_up   <- df %>% filter(combined == 1, eff_direction == '+') %>% pull(gene) %>% unique() %>% na.omit()
+  plotgo(goi_up, title = sprintf("Upregulated after p-value combination, %d dpi", day),universe = uni)
+  goi_down <- df %>% filter(combined == 1, eff_direction == '-') %>% pull(gene) %>% unique() %>% na.omit()
+  plotgo(goi_down, title = sprintf("Downregulated after p-value combination, %d dpi", day),universe = uni)
+}
+```
+
+## 8.3 Robust genes
+
+```{r, fig.height=15, fig.width=15}
+for (day in 1:3) {
+  df <- get(paste0("combined_", day, "_jackknife"))
+  uni <- intersect(TERM2GENE$gene, df$gene)
+  goi_up   <- df %>% filter(robust == 1, eff_direction == '+') %>% pull(gene) %>% unique() %>% na.omit()
+  plotgo(goi_up,   title = sprintf("Upregulated among robust DEGs, %d dpi", day),universe = uni)
+  goi_down <- df %>% filter(robust == 1, eff_direction == '-') %>% pull(gene) %>% unique() %>% na.omit()
+  plotgo(goi_down, title = sprintf("Downregulated among robust DEGs, %d dpi", day),universe = uni)
+}
+```
+
+# 9. KEGG enrichment
+## 9.1 apla
+
+```{r}
+# Duck-native KEGG: NCBI GeneIDs from the T2T RefSeq annotation map directly
+# onto KEGG organism 'apla' — no ortholog projection needed.
+apla_ids <- sub("^ncbi-geneid:", "", KEGGREST::keggConv("ncbi-geneid", "apla"))
+
+add_entrez <- function(df) {
+  df %>%
+    left_join(annotation_data %>% dplyr::select(gene = ensembl_gene_id, entrezgene_id),
+              by = "gene") %>%
+    filter(!is.na(entrezgene_id)) %>%
+    mutate(entrezgene_id = as.character(entrezgene_id))
+}
+
+combined_1_jackknife_apla <- add_entrez(combined_1_jackknife)
+combined_2_jackknife_apla <- add_entrez(combined_2_jackknife)
+combined_3_jackknife_apla <- add_entrez(combined_3_jackknife)
+
+plotkegg <- function(target_genes, title, organism, universe = NULL) {
+  kegg_enrich <- enrichKEGG(gene = target_genes, organism = organism,
+                            universe = universe, pvalueCutoff = 0.05)
+  if (!is.null(kegg_enrich) && nrow(kegg_enrich@result) > 0)
+    print(barplot(kegg_enrich, showCategory = 20, title = title))
+  else
+    message("No KEGG enrichment found.")
+}
+```
+
+## 9.2 KEGG barplots
+
+```{r, fig.width=15, fig.height=15}
+kegg_subsets <- list(
+  list(filter_expr = quote(combined == 1 & eff_direction == '+'), label = "upregulated (combined)"),
+  list(filter_expr = quote(combined == 1 & eff_direction == '-'), label = "downregulated (combined)"),
+  list(filter_expr = quote(robust == 1 & eff_direction == '+'), label = "upregulated (robust)"),
+  list(filter_expr = quote(robust == 1 & eff_direction == '-'), label = "downregulated (robust)")
+)
+
+for (day in 1:3) {
+  df  <- get(paste0("combined_", day, "_jackknife_apla"))
+  uni <- intersect(apla_ids, unique(df$entrezgene_id))
+  for (ss in kegg_subsets) {
+    goi <- df %>% filter(!!ss$filter_expr) %>% pull(entrezgene_id) %>% unique() %>% na.omit()
+    goi <- intersect(goi, uni)
+    plotkegg(goi, sprintf("%s, %d dpi", ss$label, day), "apla", universe = uni)
+  }
+}
+rm(kegg_subsets)
+```
+
+### 9.2.1 Common genes (robust, all studies)
+
+```{r, fig.width=15, fig.height=15}
+for (day in 1:3) {
+  df  <- get(paste0("combined_", day, "_jackknife_apla"))
+  uni <- intersect(apla_ids, unique(df$entrezgene_id))
+  filter_expr <- if (day == 2)
+    quote(robust == 1 & campbell == 1 & morris_2_3_2_1 == 1 & morris_2_2 == 1)
+  else
+    quote(robust == 1 & campbell == 1 & smith == 1)
+  goi <- df %>% filter(!!filter_expr) %>% pull(entrezgene_id) %>% unique() %>% na.omit()
+  goi <- intersect(goi, uni)
+  plotkegg(goi, sprintf("common genes across all studies (robust), %d dpi", day), "apla",
+           universe = uni)
+}
+```
+
+# 10. Pathway visualisation (pathview)
+
+```{r, message=FALSE, warning=FALSE}
+for (day in 1:3) {
+  obj_name <- paste0("combined_", day, "_jackknife_apla")
+  df <- get(obj_name)
+  assign(obj_name, df %>% mutate(direction_value = ifelse(eff_direction == "+", 1, -1)))
+}
+
+pathway_ids <- c(
+  'apla05164', # Influenza A
+  'apla04620', # Toll-like receptor
+  'apla04621', # NOD-like receptor
+  'apla04622', # RIG-I-like receptor
+  'apla04210', # Apoptosis
+  'apla04217'  # Necroptosis
+)
+
+# Confirm these maps exist for apla before looping
+apla_paths <- names(KEGGREST::keggList("pathway", "apla"))
+setdiff(pathway_ids, sub("^path:", "", apla_paths))   # expect character(0)
+
+df_list <- list(
+  day1 = combined_1_jackknife_apla,
+  day2 = combined_2_jackknife_apla,
+  day3 = combined_3_jackknife_apla
+)
+
+for (day_label in names(df_list)) {
+  df <- df_list[[day_label]]
+  for (subset_type in c("robust", "combined")) {
+    if (!subset_type %in% colnames(df)) next
+    # On days 1 and 3 robust is a subset rule over combined; skip the redundant map
+    if (subset_type == "combined" && identical(df$robust, df$combined)) next
+    subset_df <- df[df[[subset_type]] == 1, c("entrezgene_id", "direction_value")]
+    if (nrow(subset_df) == 0) next
+    gene_data <- setNames(subset_df$direction_value, as.character(subset_df$entrezgene_id))
+    for (pathway in pathway_ids) {
+      tryCatch(
+        pathview(gene.data = gene_data, pathway.id = pathway, species = "apla",
+                 gene.idtype = "KEGG",
+                 verbose = TRUE, kegg.native = TRUE,
+                 out.suffix = paste0(day_label, "_", subset_type),
+                 limit = list(gene = 2, cpd = 1),
+                 low = list(gene = "red", cpd = "blue"),
+                 mid = list(gene = "gray", cpd = "gray"),
+                 high = list(gene = "green", cpd = "yellow")),
+        error = function(e) {
+          message("pathview failed for ", pathway, " (", day_label, "/", subset_type, "): ", e$message)
+          pathview(gene.data = gene_data, pathway.id = pathway, species = "apla",
+                   gene.idtype = "KEGG",
+                   verbose = TRUE, kegg.native = FALSE,
+                   out.suffix = paste0(day_label, "_", subset_type, "_F"),
+                   limit = list(gene = 2, cpd = 1),
+                   low = list(gene = "red", cpd = "blue"),
+                   mid = list(gene = "gray", cpd = "gray"),
+                   high = list(gene = "green", cpd = "yellow"))
+        }
+      )
+    }
+  }
+}
+```
+
+# 11. Comparison of KEGG pathways across studies (compareCluster)
+
+```{r}
+cluster_cols <- list(
+  day1 = c("robust", "campbell", "smith"),
+  day2 = c("robust", "campbell", "morris_2_3_2_1", "morris_2_2"),
+  day3 = c("robust", "campbell", "smith")
+)
+
+long_title_base <- str_wrap(
+  "Overrepresented KEGG Pathways In Differentially Expressed Genes Across Days Post Infection",
+  width = 60
+)
+
+green_scale <- scale_fill_gradient(
+  low  = rgb(188, 207, 0, maxColorValue = 255),
+  high = rgb(58, 170, 53, maxColorValue = 255)
+)
+
+title_theme <- theme(plot.title = element_text(hjust = 0.5, size = 14, margin = margin(b = 10)))
+
+run_kegg_compare <- function(df_list, cluster_cols, direction_filter = NULL, title_suffix = "") {
+  for (day in names(df_list)) {
+    df <- df_list[[day]]
+    uni <- intersect(apla_ids, unique(as.character(df$entrezgene_id)))
+    if (!is.null(direction_filter)) df <- df %>% filter(eff_direction == direction_filter)
+    cols <- cluster_cols[[day]]
+    geneclusters <- Filter(function(x) length(x) > 0, setNames(
+      lapply(cols, function(col) {
+        if (col %in% colnames(df))
+          intersect(as.character(df$entrezgene_id[df[[col]] == 1]), uni) else NULL
+      }), cols))
+    if (length(geneclusters) == 0) { message(sprintf("No clusters for %s; skipping.", day)); next }
+    cc <- compareCluster(geneclusters, fun = "enrichKEGG", organism = "apla",
+                         universe = uni, pvalueCutoff = 0.05)
+    long_title <- str_wrap(paste0(long_title_base, title_suffix), width = 60)
+    print(dotplot(cc) + ggtitle(long_title) + green_scale + title_theme)
+  }
+}
+
+run_kegg_compare(df_list, cluster_cols)
+run_kegg_compare(df_list, cluster_cols, direction_filter = "+", title_suffix = " (Upregulated)")
+run_kegg_compare(df_list, cluster_cols, direction_filter = "-", title_suffix = " (Downregulated)")
+```
+
+## 11.4 Robust DEGs across days (single compareCluster)
+
+```{r}
+uni_kegg_all <- Reduce(intersect, lapply(df_list, function(df)
+  intersect(apla_ids, unique(as.character(df$entrezgene_id)))))
+
+geneclusters_days <- setNames(
+  lapply(names(df_list), function(day) {
+    df <- df_list[[day]]
+    intersect(unique(as.character(df$entrezgene_id[df$robust == 1 & !is.na(df$entrezgene_id)])),
+              uni_kegg_all)
+  }),
+  c("Day 1", "Day 2", "Day 3")
+)
+geneclusters_days <- Filter(function(x) length(x) > 0, geneclusters_days)
+
+cc_days <- compareCluster(geneclusters_days, fun = "enrichKEGG",
+                          organism = "apla", universe = uni_kegg_all, pvalueCutoff = 0.05)
+cc_days@compareClusterResult$Cluster <- factor(cc_days@compareClusterResult$Cluster,
+                                               levels = names(geneclusters_days))
+print(dotplot(cc_days) +
+  ggtitle(str_wrap("KEGG Pathways in Robust DEGs Across Days Post Infection", 60)) +
+  green_scale + title_theme)
+
+geneclusters6 <- unlist(lapply(seq_along(df_list), function(i) {
+  df <- df_list[[i]]
+  list(
+    up   = intersect(unique(as.character(df$entrezgene_id[df$robust == 1 & df$eff_direction == '+'])), uni_kegg_all),
+    down = intersect(unique(as.character(df$entrezgene_id[df$robust == 1 & df$eff_direction == '-'])), uni_kegg_all)
+  ) |> setNames(paste0("Day ", i, c(" (Up)", " (Down)")))
+}), recursive = FALSE)
+geneclusters6 <- Filter(function(x) length(x) > 0, geneclusters6)
+
+cc6 <- compareCluster(geneclusters6, fun = "enrichKEGG", organism = "apla",
+                      universe = uni_kegg_all, pvalueCutoff = 0.05)
+cc6@compareClusterResult$Cluster <- factor(cc6@compareClusterResult$Cluster, levels = names(geneclusters6))
+print(dotplot(cc6) +
+  ggtitle(str_wrap("KEGG Pathways in Robust DEGs (Up/Down) Across Days", 60)) +
+  green_scale + title_theme)
+```
+
+## 11.5 GO terms across days (custom GMT, enricher)
+
+```{r}
+# Adapter: gene2go table in the column names run_cc_namespace expects
+go_ann <- go_tbl %>%
+  dplyr::select(go_id = GO_ID, ensembl_gene_id = gene,
+                name_1006 = GO_term, namespace_1003)
+
+df_list_go <- list(
+  day1 = combined_1_jackknife,
+  day2 = combined_2_jackknife,
+  day3 = combined_3_jackknife
+)
+
+uni_go_all <- Reduce(intersect, lapply(df_list_go, function(df) df$gene))
+
+geneclusters_go <- setNames(
+  lapply(df_list_go, function(df) {
+    intersect(unique(as.character(na.omit(df$gene[df$robust == 1]))), uni_go_all)
+  }),
+  c("Day 1", "Day 2", "Day 3")
+)
+geneclusters_go <- Filter(function(x) length(x) > 0, geneclusters_go)
+
+run_cc_namespace <- function(annotation_data, geneclusters, namespace_value,
+                             pretty_ns = NULL, universe = NULL, pvalueCutoff = 0.05,
+                             qvalueCutoff = 0.20, minGSSize = 5) {
+  stopifnot("namespace_1003" %in% colnames(annotation_data))
+  if (is.null(pretty_ns)) pretty_ns <- tools::toTitleCase(gsub("_", " ", namespace_value))
+
+  ann_ns <- annotation_data %>%
+    dplyr::filter(!is.na(go_id), !is.na(ensembl_gene_id), namespace_1003 == namespace_value)
+  if (nrow(ann_ns) == 0) { message("No rows for namespace '", namespace_value, "'"); return(invisible(NULL)) }
+
+  TERM2GENE_ns <- ann_ns %>% dplyr::select(go_id, ensembl_gene_id) %>% distinct()
+  TERM2NAME_ns <- ann_ns %>% dplyr::select(go_id, name_1006) %>% distinct()
+
+  bg <- if (is.null(universe)) unique(TERM2GENE_ns$ensembl_gene_id)
+        else intersect(unique(TERM2GENE_ns$ensembl_gene_id), universe)
+
+  cc_obj <- tryCatch(
+    compareCluster(geneClusters = geneclusters, fun = "enricher",
+                   TERM2GENE = TERM2GENE_ns, TERM2NAME = TERM2NAME_ns,
+                   universe = bg, pAdjustMethod = "BH",
+                   pvalueCutoff = pvalueCutoff, qvalueCutoff = qvalueCutoff,
+                   minGSSize = minGSSize),
+    error = function(e) { message("compareCluster error: ", e$message); NULL }
+  )
+
+  cc_df <- tryCatch(as.data.frame(cc_obj), error = function(e) NULL)
+  if (is.null(cc_df) || nrow(cc_df) == 0) {
+    message("No enrichment found for namespace '", namespace_value, "'")
+    return(invisible(NULL))
+  }
+
+  cc_obj@compareClusterResult$Cluster <- factor(cc_obj@compareClusterResult$Cluster,
+                                                 levels = names(geneclusters))
+  p <- dotplot(cc_obj) +
+    ggtitle(str_wrap(sprintf("GO %s — Robust DEGs Across Days", pretty_ns), 60)) +
+    green_scale + title_theme
+  print(p)
+  invisible(list(cc_object = cc_obj, cc_df = cc_df, plot = p))
+}
+
+ns_map <- c("biological_process" = "Biological Process",
+            "molecular_function" = "Molecular Function",
+            "cellular_component" = "Cellular Component")
+
+res_bp    <- run_cc_namespace(go_ann, geneclusters_go, "biological_process", ns_map[1], universe = uni_go_all)
+res_mf    <- run_cc_namespace(go_ann, geneclusters_go, "molecular_function", ns_map[2], universe = uni_go_all)
+res_cc_go <- run_cc_namespace(go_ann, geneclusters_go, "cellular_component", ns_map[3], universe = uni_go_all)
+```
+
+## 11.6 Common genes across all days
+
+```{r}
+genes_all_jackknife <- Reduce(intersect, lapply(1:3, function(d)
+  get(paste0("combined_", d, "_jackknife_apla")) %>%
+    filter(robust == 1) %>% pull(gene)
+))
+
+build_day_df <- function(day, genes) {
+  get(paste0("combined_", day, "_jackknife_apla")) %>%
+    filter(gene %in% genes) %>%
+    dplyr::select(gene, gene_name, p_combined, FDR_combined, eff_direction) %>%
+    rename_with(~ paste0(., "_day", day), c(p_combined, FDR_combined, eff_direction))
+}
+
+d1 <- build_day_df(1, genes_all_jackknife)
+d2 <- build_day_df(2, genes_all_jackknife) %>% dplyr::select(-gene_name)
+d3 <- build_day_df(3, genes_all_jackknife) %>% dplyr::select(-gene_name)
+
+merged_jackknife <- d1 %>%
+  inner_join(d2, by = "gene") %>%
+  inner_join(d3, by = "gene") %>%
+  relocate(gene_name, .after = gene) %>%
+  filter(!is.na(gene_name) & gene_name != "")
+
+datatable(merged_jackknife, rownames = FALSE)
+rm(d1, d2, d3, build_day_df, genes_all_jackknife)
+```
+
+# 12. Publication figure — KEGG + GO panel
+
+```{r final_enrichment_figure, warning=FALSE, message=FALSE, fig.width=15, fig.height=30}
+suppressPackageStartupMessages({
+  library(enrichplot)
+  library(patchwork)
+})
+
+geneclusters_kegg <- setNames(
+  lapply(1:3, function(d) {
+    df <- get(paste0("combined_", d, "_jackknife_apla"))
+    intersect(unique(na.omit(as.character(df$entrezgene_id[df$robust == 1]))), uni_kegg_all)
+  }),
+  c("Day_1", "Day_2", "Day_3")
+)
+geneclusters_kegg <- Filter(function(x) length(x) > 0, geneclusters_kegg)
+
+cc_kegg <- compareCluster(geneclusters_kegg, fun = "enrichKEGG",
+                          organism = "apla", universe = uni_kegg_all, pvalueCutoff = 0.05)
+cc_kegg@compareClusterResult$Cluster <- factor(cc_kegg@compareClusterResult$Cluster,
+                                               levels = names(geneclusters_kegg))
+
+ann_bp <- go_ann %>% filter(namespace_1003 == "biological_process")
+TERM2GENE_BP <- ann_bp %>% dplyr::select(go_id, ensembl_gene_id) %>% distinct()
+TERM2NAME_BP <- ann_bp %>% dplyr::select(go_id, name_1006) %>% distinct()
+
+geneclusters_gobp <- setNames(
+  lapply(1:3, function(d) {
+    df <- get(paste0("combined_", d, "_jackknife"))
+    intersect(unique(na.omit(as.character(df$gene[df$robust == 1]))), uni_go_all)
+  }),
+  c("Day_1", "Day_2", "Day_3")
+)
+geneclusters_gobp <- Filter(function(x) length(x) > 0, geneclusters_gobp)
+
+cc_go_bp <- compareCluster(
+  geneclusters_gobp, fun = "enricher",
+  TERM2GENE = TERM2GENE_BP, TERM2NAME = TERM2NAME_BP,
+  universe = intersect(unique(TERM2GENE_BP$ensembl_gene_id), uni_go_all),
+  pAdjustMethod = "BH", pvalueCutoff = 0.05,
+  qvalueCutoff = 0.20, minGSSize = 5
+)
+cc_go_bp@compareClusterResult$Cluster <- factor(cc_go_bp@compareClusterResult$Cluster,
+                                                levels = names(geneclusters_gobp))
+# Shared scale helpers
+extract_minimal <- function(cc_obj) {
+  df <- as.data.frame(cc_obj)
+  df$GeneRatio_num <- sapply(df$GeneRatio, function(x) {
+    parts <- strsplit(as.character(x), "/")[[1]]
+    if (length(parts) != 2) return(NA_real_)
+    as.numeric(parts[1]) / as.numeric(parts[2])
+  })
+  dplyr::select(df, p.adjust, GeneRatio = GeneRatio_num)
+}
+
+safe_range <- function(x, eps = 1e-6) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(c(0, 1))
+  mn <- min(x); mx <- max(x)
+  if (isTRUE(all.equal(mn, mx))) return(c(mn * (1 - eps), mx * (1 + eps)))
+  c(mn, mx)
+}
+
+all_min   <- bind_rows(extract_minimal(cc_kegg), extract_minimal(cc_go_bp)) %>%
+             filter(!is.na(p.adjust), !is.na(GeneRatio))
+pval_range <- safe_range(all_min$p.adjust)
+gr_range   <- safe_range(all_min$GeneRatio)
+
+pub_fill <- scale_fill_gradient(
+  low = rgb(188, 207, 0, maxColorValue = 255),
+  high = rgb(58, 170, 53, maxColorValue = 255),
+  limits = pval_range, name = "Adjusted p-value", na.value = "grey50"
+)
+pub_size <- scale_size(limits = gr_range, range = c(2, 8), name = "Gene Ratio")
+
+p_kegg_pub <- dotplot(cc_kegg) +
+  ggtitle("KEGG Pathways") + pub_fill + pub_size +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        axis.text  = element_text(size = 9), legend.position = "right")
+
+p_go_bp_pub <- dotplot(cc_go_bp) +
+  ggtitle("GO Biological Processes") + pub_fill + pub_size +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        axis.text  = element_text(size = 9), legend.position = "none")
+
+final_pub_plot <- (p_kegg_pub | p_go_bp_pub) +
+  plot_layout(guides = "collect", widths = c(1, 1)) +
+  plot_annotation(
+    title = str_wrap("Functional Enrichment of Robust DEGs Across Days Post Infection", 80),
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold", margin = margin(b = 12)),
+      plot.tag   = element_text(size = 14, face = "bold")
+    )
+  )
+
+print(final_pub_plot)
+ggsave("Figure_Functional_Enrichment_Jackknife_noHuang.pdf", final_pub_plot,
+       width = 12, height = 6, device = cairo_pdf)
+ggsave("Figure_Functional_Enrichment_Jackknife_noHuang.png", final_pub_plot,
+       width = 12, height = 6, dpi = 600)
+
+message("Figure exported: Figure_Functional_Enrichment_Jackknife_noHuang.{pdf,png}")
+```
